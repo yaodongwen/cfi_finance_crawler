@@ -1,0 +1,15 @@
+site_id: stockhouse
+
+country: CA
+
+timezone: America/Toronto
+
+enabled: false
+
+transport:
+  type: auto
+
+datasets:
+  - news_article
+  - forum_post
+  - comment

@@ -1,0 +1,59 @@
+platform:
+
+  schema_version: 1
+
+
+storage:
+
+  local:
+
+    state_dir: state
+
+    spool_dir: spool
+
+    warehouse_dir: warehouse
+
+
+  parquet:
+
+    compression: zstd
+
+    target_bytes: 268435456
+
+    min_rows: 10000
+
+    max_rows: 500000
+
+    flush_seconds: 30
+
+
+  partition:
+
+    bucket_count: 256
+
+
+upload:
+
+  method: auto
+
+  workers: 2
+
+  verify:
+
+    file_size: true
+
+    sha256: true
+
+
+postgres:
+
+  schema: marketdata
+
+
+runtime:
+
+  queue_max_records: 100000
+
+  storage_workers: 2
+
+  shutdown_grace_seconds: 30

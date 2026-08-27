@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: crawl-framework
+Version: 0.1.0
+Summary: Reusable financial website crawling and storage framework
+Requires-Python: >=3.11
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: pyarrow>=15
+Provides-Extra: postgres
+Requires-Dist: psycopg[binary]>=3.1; extra == "postgres"
+Provides-Extra: http
+Requires-Dist: httpx>=0.27; extra == "http"
+Provides-Extra: playwright
+Requires-Dist: playwright>=1.45; extra == "playwright"
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"

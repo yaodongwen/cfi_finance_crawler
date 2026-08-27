@@ -1,0 +1,15 @@
+site_id: naver_finance
+
+country: KR
+
+timezone: Asia/Seoul
+
+enabled: false
+
+transport:
+  type: http
+
+datasets:
+  - news_article
+  - news_instrument
+  - forum_post

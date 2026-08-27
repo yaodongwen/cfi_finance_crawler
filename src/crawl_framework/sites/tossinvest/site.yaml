@@ -1,0 +1,15 @@
+site_id: tossinvest
+
+country: KR
+
+timezone: Asia/Seoul
+
+enabled: false
+
+transport:
+  type: playwright
+
+datasets:
+  - news_article
+  - news_instrument
+  - forum_post

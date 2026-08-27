@@ -1,0 +1,15 @@
+PyYAML>=6.0
+pyarrow>=15
+
+[dev]
+pytest>=8
+ruff>=0.5
+
+[http]
+httpx>=0.27
+
+[playwright]
+playwright>=1.45
+
+[postgres]
+psycopg[binary]>=3.1

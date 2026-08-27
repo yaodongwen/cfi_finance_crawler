@@ -1,0 +1,20 @@
+sites:
+
+  naver_finance:
+
+    enabled: false
+
+
+  tossinvest:
+
+    enabled: false
+
+
+  hotcopper:
+
+    enabled: false
+
+
+  stockhouse:
+
+    enabled: false

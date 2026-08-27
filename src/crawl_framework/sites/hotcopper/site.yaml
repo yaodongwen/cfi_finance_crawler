@@ -1,0 +1,15 @@
+site_id: hotcopper
+
+country: AU
+
+timezone: Australia/Sydney
+
+enabled: false
+
+transport:
+  type: auto
+
+datasets:
+  - forum_post
+  - comment
+  - author_profile

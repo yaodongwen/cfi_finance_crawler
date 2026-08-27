@@ -1,0 +1,57 @@
+local:
+  output_dir: "/Users/yaodongdong/Desktop/naver/outputs"
+  warehouse_dir: "../warehouse"
+  index_cache_dir: "../index_cache"
+
+server:
+  host: "192.168.1.33"
+  user: "dwyao"
+  data_dir: "/mnt/nas-intern/homes/dwyao/Data/stocklake"
+
+postgres:
+  host: "192.168.1.33"
+  port: 5432
+  database: "stock_data"
+  user: "stock"
+  password: "Stock2026Secure!"
+
+storage:
+  local_warehouse: "../warehouse"
+  server_warehouse: "/mnt/nas-intern/homes/dwyao/Data/stocklake"
+
+  partition:
+    max_rows: 50000
+
+  compression:
+    codec: "zstd"
+
+sync:
+  delete_after_upload: true
+  method: auto
+
+  rsync:
+    enabled: true
+    ssh_port: 22
+
+watch:
+  interval_seconds: 20
+  quiet_seconds: 30
+  min_files: 100
+  min_bytes: 10485760
+  max_files_per_batch: 5000
+  run_on_exit: true
+
+research:
+  project_dir: "/Users/yaodongdong/Desktop/naver_research"
+  warehouse_dir: "/Users/yaodongdong/Desktop/naver_research/warehouse"
+  pdf_dir: "/Users/yaodongdong/Desktop/naver_research/research_spool/pdf"
+  remote_pdf_dir: "/mnt/nas-intern/homes/dwyao/Data/stocklake/research_pdf"
+  sync_pdf: true
+  delete_after_upload: true
+
+  watch:
+    interval_seconds: 30
+    quiet_seconds: 60
+    min_files: 20
+    min_bytes: 104857600
+    max_files_per_batch: 2000
