@@ -116,6 +116,38 @@ class PipelineRecordDecision:
     frozen=True,
     slots=True,
 )
+class PreparedBatch:
+    """
+    Local durable batch prepared for upload.
+    """
+
+    batch: FlushBatch
+
+    parquet_info: ParquetFileInfo
+
+    manifest: RecoveryManifest
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
+class UploadedBatch:
+    """
+    Prepared batch after verified remote upload.
+    """
+
+    prepared: PreparedBatch
+
+    upload_result: UploadResult
+
+    manifest: RecoveryManifest
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
 class BatchProcessResult:
     """
     一个 FlushBatch 完整生命周期执行结果。
@@ -364,6 +396,82 @@ class StoragePipeline:
         )
 
 
+    def submit_for_staged_runtime(
+        self,
+        record: CanonicalRecord,
+        *,
+        scope_token: str | None = None,
+    ) -> tuple[
+        PipelineRecordDecision,
+        list[FlushBatch],
+    ]:
+        """
+        Submit a record for the concurrent staged production runtime.
+
+        This intentionally stops at SeenStore inspect + buffer. Any flushed
+        batches are returned to the runtime so write/upload/catalog can move
+        through bounded queues instead of running synchronously here.
+        """
+
+        self.stats.records_seen += 1
+
+        seen = self.seen_store.inspect(
+            record.record_uid,
+            record.version_hash,
+        )
+
+        if seen.decision == "unchanged":
+
+            self.stats.records_unchanged += 1
+
+            return (
+                PipelineRecordDecision(
+                    record_uid=(
+                        record.record_uid
+                    ),
+                    version_hash=(
+                        record.version_hash
+                    ),
+                    decision="unchanged",
+                    buffered=False,
+                ),
+                [],
+            )
+
+        if seen.decision == "new":
+
+            self.stats.records_new += 1
+
+        elif seen.decision == "updated":
+
+            self.stats.records_updated += 1
+
+        batch = self.buffer.add(
+            record,
+            scope_token=scope_token,
+        )
+
+        self.stats.records_buffered += 1
+
+        return (
+            PipelineRecordDecision(
+                record_uid=(
+                    record.record_uid
+                ),
+                version_hash=(
+                    record.version_hash
+                ),
+                decision=seen.decision,
+                buffered=True,
+            ),
+            (
+                [batch]
+                if batch is not None
+                else []
+            ),
+        )
+
+
     def submit_many(
         self,
         records: Iterable[
@@ -592,198 +700,21 @@ class StoragePipeline:
         顺序不能随意改变。
         """
 
-        parquet_info = None
-
         manifest = None
 
         try:
 
-            # =================================================
-            # 1. Write local Parquet
-            # =================================================
-
-            parquet_info = (
-                self.parquet_writer
-                .write_batch(
-                    batch
-                )
+            prepared = self.prepare_batch(
+                batch
             )
 
-            self.stats.files_written += 1
+            manifest = prepared.manifest
 
-            # =================================================
-            # 1.5 Write recovery record index
-            # =================================================
-
-            record_index_info = (
-                self.record_index_store
-                .write_for_parquet(
-                    parquet_info.file_path,
-                    batch.records,
-                )
+            uploaded = self.upload_prepared_batch(
+                prepared
             )
 
-            # =================================================
-            # 2. Recovery Manifest
-            # =================================================
-
-            manifest = (
-                self._create_manifest(
-                    parquet_info,
-                    record_index_path=(
-                        record_index_info
-                        .file_path
-                    ),
-                )
-            )
-
-            self.recovery_store.save(
-                manifest
-            )
-
-            # =================================================
-            # 3. Upload
-            # =================================================
-
-            upload_result = (
-                self.uploader.upload(
-                    parquet_info
-                )
-            )
-
-            if upload_result.status in {
-                "uploaded",
-                "verified",
-            }:
-
-                self.stats.files_uploaded += 1
-
-            else:
-
-                raise RuntimeError(
-                    "unexpected upload status: "
-                    f"{upload_result.status!r}"
-                )
-
-            manifest = (
-                self.recovery_store
-                .advance(
-                    manifest.manifest_id,
-                    "uploaded",
-                    remote_path=(
-                        upload_result
-                        .remote_path
-                    ),
-                )
-            )
-
-            # =================================================
-            # 4. Verify
-            # =================================================
-
-            verified = (
-                upload_result.status
-                == "verified"
-            )
-
-            if not verified:
-
-                raise RuntimeError(
-                    "upload completed but "
-                    "remote file was not verified"
-                )
-
-            self.stats.files_verified += 1
-
-            manifest = (
-                self.recovery_store
-                .advance(
-                    manifest.manifest_id,
-                    "verified",
-                )
-            )
-
-            # =================================================
-            # 5. PostgreSQL Catalog
-            # =================================================
-
-            self.catalog.register_parquet_file(
-                parquet_info
-            )
-
-            # =================================================
-            # Mark remote upload in PostgreSQL catalog
-            # =================================================
-
-            # if (
-            #     upload_result.remote_path
-            #     is not None
-            # ):
-
-            #     self.catalog.mark_uploaded(
-            #         file_path=(
-            #             parquet_info.relative_path
-            #         ),
-            #         remote_path=(
-            #             upload_result.remote_path
-            #         ),
-            #     )
-            remote_path = str(
-                upload_result.remote_path
-            ).strip()
-
-            if not remote_path:
-
-                raise RuntimeError(
-                    "verified upload has no "
-                    "remote_path"
-                )
-
-            self.catalog.mark_uploaded(
-                file_path=(
-                    parquet_info.relative_path
-                ),
-                remote_path=(
-                    remote_path
-                ),
-            )
-
-            self.stats.files_registered += 1
-
-            manifest = (
-                self.recovery_store
-                .advance(
-                    manifest.manifest_id,
-                    "catalog_registered",
-                )
-            )
-
-            # =================================================
-            # 6. SeenStore commit
-            # =================================================
-
-            seen_rows = [
-                (
-                    record.record_uid,
-                    record.version_hash,
-                )
-                for record
-                in batch.records
-            ]
-
-            self.seen_store.commit_many(
-                seen_rows
-            )
-
-            seen_committed = True
-
-            manifest = (
-                self.recovery_store
-                .advance(
-                    manifest.manifest_id,
-                    "seen_committed",
-                )
-            )
+            manifest = uploaded.manifest
 
             # =================================================
             # 7. Optional legacy batch checkpoint
@@ -824,74 +755,13 @@ class StoragePipeline:
                     checkpoint,
                 )
 
-            manifest = (
-                self.recovery_store
-                .advance(
-                    manifest.manifest_id,
-                    "checkpoint_committed",
-                )
+            result = self.catalog_uploaded_batch(
+                uploaded,
+                checkpoint_key=checkpoint_key,
+                checkpoint=checkpoint,
             )
 
-            # =================================================
-            # 8. Cleanable
-            # =================================================
-
-            manifest = (
-                self.recovery_store
-                .advance(
-                    manifest.manifest_id,
-                    "cleanable",
-                )
-            )
-
-            # =================================================
-            # 9. Cleaner
-            # =================================================
-
-            cleanup_context = (
-                CleanupContext(
-                    uploaded=True,
-                    verified=True,
-                    catalog_registered=True,
-                    seen_committed=True,
-                    checkpoint_committed=True,
-                )
-            )
-
-            cleanup_result = (
-                self.cleaner.clean(
-                    parquet_info,
-                    cleanup_context,
-                )
-            )
-
-            local_deleted = (
-                cleanup_result.deleted
-            )
-
-            if local_deleted:
-
-                self.stats.files_deleted += 1
-
-                self.recovery_store.advance(
-                    manifest.manifest_id,
-                    "deleted",
-                )
-
-            return BatchProcessResult(
-                parquet_info=parquet_info,
-                upload_result=upload_result,
-                catalog_registered=True,
-                seen_committed=(
-                    seen_committed
-                ),
-                checkpoint_committed=(
-                    checkpoint_committed
-                ),
-                local_deleted=(
-                    local_deleted
-                ),
-            )
+            return result
 
         except Exception as exc:
 
@@ -919,6 +789,294 @@ class StoragePipeline:
                     pass
 
             raise
+
+
+    def prepare_batch(
+        self,
+        batch: FlushBatch,
+    ) -> PreparedBatch:
+        """
+        Stage 1: write local Parquet, record index, and recovery manifest.
+        """
+
+        parquet_info = (
+            self.parquet_writer
+            .write_batch(
+                batch
+            )
+        )
+
+        self.stats.files_written += 1
+
+        record_index_info = (
+            self.record_index_store
+            .write_for_parquet(
+                parquet_info.file_path,
+                batch.records,
+            )
+        )
+
+        manifest = (
+            self._create_manifest(
+                parquet_info,
+                record_index_path=(
+                    record_index_info
+                    .file_path
+                ),
+            )
+        )
+
+        self.recovery_store.save(
+            manifest
+        )
+
+        return PreparedBatch(
+            batch=batch,
+            parquet_info=parquet_info,
+            manifest=manifest,
+        )
+
+
+    def upload_prepared_batch(
+        self,
+        prepared: PreparedBatch,
+    ) -> UploadedBatch:
+        """
+        Stage 2: upload and verify a prepared local batch.
+        """
+
+        upload_result = (
+            self.uploader.upload(
+                prepared.parquet_info
+            )
+        )
+
+        if upload_result.status in {
+            "uploaded",
+            "verified",
+        }:
+
+            self.stats.files_uploaded += 1
+
+        else:
+
+            raise RuntimeError(
+                "unexpected upload status: "
+                f"{upload_result.status!r}"
+            )
+
+        manifest = (
+            self.recovery_store
+            .advance(
+                prepared.manifest.manifest_id,
+                "uploaded",
+                remote_path=(
+                    upload_result
+                    .remote_path
+                ),
+            )
+        )
+
+        if upload_result.status != "verified":
+
+            raise RuntimeError(
+                "upload completed but "
+                "remote file was not verified"
+            )
+
+        self.stats.files_verified += 1
+
+        manifest = (
+            self.recovery_store
+            .advance(
+                manifest.manifest_id,
+                "verified",
+            )
+        )
+
+        return UploadedBatch(
+            prepared=prepared,
+            upload_result=upload_result,
+            manifest=manifest,
+        )
+
+
+    def catalog_uploaded_batch(
+        self,
+        uploaded: UploadedBatch,
+        *,
+        checkpoint_key: CheckpointKey | None = None,
+        checkpoint=None,
+    ) -> BatchProcessResult:
+        """
+        Stage 3: Catalog/index, SeenStore commit, optional checkpoint, cleanup.
+        """
+
+        parquet_info = (
+            uploaded
+            .prepared
+            .parquet_info
+        )
+
+        batch = (
+            uploaded
+            .prepared
+            .batch
+        )
+
+        manifest = (
+            uploaded
+            .manifest
+        )
+
+        self.catalog.register_parquet_file(
+            parquet_info
+        )
+
+        remote_path = str(
+            uploaded
+            .upload_result
+            .remote_path
+        ).strip()
+
+        if not remote_path:
+
+            raise RuntimeError(
+                "verified upload has no "
+                "remote_path"
+            )
+
+        self.catalog.mark_uploaded(
+            file_path=(
+                parquet_info.relative_path
+            ),
+            remote_path=(
+                remote_path
+            ),
+        )
+
+        self.stats.files_registered += 1
+
+        manifest = (
+            self.recovery_store
+            .advance(
+                manifest.manifest_id,
+                "catalog_registered",
+            )
+        )
+
+        seen_rows = [
+            (
+                record.record_uid,
+                record.version_hash,
+            )
+            for record
+            in batch.records
+        ]
+
+        self.seen_store.commit_many(
+            seen_rows
+        )
+
+        manifest = (
+            self.recovery_store
+            .advance(
+                manifest.manifest_id,
+                "seen_committed",
+            )
+        )
+
+        checkpoint_committed = True
+
+        if (
+            checkpoint_key is not None
+            or checkpoint is not None
+        ):
+
+            if (
+                checkpoint_key is None
+                or checkpoint is None
+            ):
+
+                raise ValueError(
+                    "checkpoint_key and "
+                    "checkpoint must be "
+                    "provided together"
+                )
+
+            if self.checkpoint_store is None:
+
+                raise RuntimeError(
+                    "checkpoint_store "
+                    "is not configured"
+                )
+
+            self.checkpoint_store.save(
+                checkpoint_key,
+                checkpoint,
+            )
+
+        manifest = (
+            self.recovery_store
+            .advance(
+                manifest.manifest_id,
+                "checkpoint_committed",
+            )
+        )
+
+        manifest = (
+            self.recovery_store
+            .advance(
+                manifest.manifest_id,
+                "cleanable",
+            )
+        )
+
+        cleanup_context = (
+            CleanupContext(
+                uploaded=True,
+                verified=True,
+                catalog_registered=True,
+                seen_committed=True,
+                checkpoint_committed=True,
+            )
+        )
+
+        cleanup_result = (
+            self.cleaner.clean(
+                parquet_info,
+                cleanup_context,
+            )
+        )
+
+        local_deleted = (
+            cleanup_result.deleted
+        )
+
+        if local_deleted:
+
+            self.stats.files_deleted += 1
+
+            self.recovery_store.advance(
+                manifest.manifest_id,
+                "deleted",
+            )
+
+        return BatchProcessResult(
+            parquet_info=parquet_info,
+            upload_result=(
+                uploaded
+                .upload_result
+            ),
+            catalog_registered=True,
+            seen_committed=True,
+            checkpoint_committed=(
+                checkpoint_committed
+            ),
+            local_deleted=(
+                local_deleted
+            ),
+        )
 
 
     # ========================================================

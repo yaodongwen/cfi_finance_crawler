@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 
-from dataclasses import dataclass
+from dataclasses import (
+    dataclass,
+    field,
+)
 from pathlib import Path
 from typing import (
     Callable,
@@ -16,6 +19,15 @@ from crawl_framework.cli.main import (
 from crawl_framework.core.bootstrap import (
     BootstrapConfig,
     CrawlBootstrap,
+)
+
+from crawl_framework.core.concurrency import (
+    QueueSizeConfig,
+    StageConcurrencyConfig,
+)
+
+from crawl_framework.core.concurrent_runtime import (
+    ConcurrentProductionRuntime,
 )
 
 from crawl_framework.core.plugin import (
@@ -339,6 +351,14 @@ class AppConfig:
     recovery_block_on_terminal_failed: bool = False
 
     recovery_block_on_remaining_pending: bool = False
+
+    stage_concurrency: StageConcurrencyConfig = field(
+        default_factory=StageConcurrencyConfig
+    )
+
+    queue_sizes: QueueSizeConfig = field(
+        default_factory=QueueSizeConfig
+    )
 
 
 # ============================================================
@@ -855,17 +875,63 @@ class AppFactory:
         )
 
         # ====================================================
-        # 15. CrawlRuntime
+        # 15. Runtime
         # ====================================================
 
-        runtime = CrawlRuntime(
-            plugin=plugin,
-            pipeline=pipeline,
-            checkpoint_store=checkpoint_store,
-            context=make_crawl_context(
-                options
-            ),
+        crawl_context = make_crawl_context(
+            options
         )
+
+        concurrency = (
+            self.config
+            .stage_concurrency
+        )
+
+        queues = (
+            self.config
+            .queue_sizes
+        )
+
+        if _use_concurrent_production_runtime(
+            concurrency
+        ):
+
+            runtime = ConcurrentProductionRuntime(
+                plugin=plugin,
+                pipeline=pipeline,
+                checkpoint_store=checkpoint_store,
+                context=crawl_context,
+                crawl_workers=(
+                    concurrency.crawl_workers
+                ),
+                writer_workers=(
+                    concurrency.writer_workers
+                ),
+                upload_workers=(
+                    concurrency.upload_workers
+                ),
+                catalog_workers=(
+                    concurrency.catalog_workers
+                ),
+                record_queue_size=(
+                    queues.records
+                ),
+                upload_queue_size=(
+                    queues.uploads
+                ),
+                catalog_queue_size=(
+                    queues.catalog
+                ),
+            )
+
+        else:
+
+            runtime = CrawlRuntime(
+                plugin=plugin,
+                pipeline=pipeline,
+                checkpoint_store=checkpoint_store,
+                context=crawl_context,
+            )
 
         # ====================================================
         # 16. Bootstrap
@@ -885,6 +951,33 @@ class AppFactory:
                 ),
             ),
         )
+
+
+# ============================================================
+# Runtime selection
+# ============================================================
+
+
+def _use_concurrent_production_runtime(
+    concurrency: StageConcurrencyConfig,
+) -> bool:
+    """
+    Production runtime selector.
+
+    Keep the legacy single-worker runtime for single-scope compatibility tests
+    and opt into the bounded staged runner when any production stage is
+    configured for parallel work.
+    """
+
+    return any(
+        worker_count > 1
+        for worker_count in (
+            concurrency.crawl_workers,
+            concurrency.writer_workers,
+            concurrency.upload_workers,
+            concurrency.catalog_workers,
+        )
+    )
 
 
 # ============================================================
@@ -1185,10 +1278,59 @@ def build_default_bootstrap(
 
     app_config = AppConfig(
         paths=app_paths,
+        buffer_target_bytes=(
+            (
+                options.target_file_size_mb
+                or framework_config
+                .storage
+                .target_file_size_mb
+            )
+            *
+            1024
+            *
+            1024
+        ),
         buffer_max_rows=(
             framework_config
             .storage
             .max_rows
+        ),
+        buffer_flush_seconds=(
+            framework_config
+            .storage
+            .max_buffer_age_seconds
+        ),
+        stage_concurrency=(
+            StageConcurrencyConfig(
+                crawl_workers=(
+                    options.crawl_workers
+                    or framework_config.runtime.crawl_workers
+                ),
+                http_concurrency=(
+                    options.http_concurrency
+                    or framework_config.runtime.http_concurrency
+                ),
+                attachment_workers=(
+                    options.attachment_workers
+                    or framework_config.runtime.attachment_workers
+                ),
+                writer_workers=(
+                    options.writer_workers
+                    or framework_config.runtime.writer_workers
+                ),
+                upload_workers=(
+                    options.upload_workers
+                    or framework_config.runtime.upload_workers
+                ),
+                catalog_workers=(
+                    options.catalog_workers
+                    or framework_config.runtime.catalog_workers
+                ),
+            )
+        ),
+        queue_sizes=(
+            framework_config
+            .queues
         ),
     )
 

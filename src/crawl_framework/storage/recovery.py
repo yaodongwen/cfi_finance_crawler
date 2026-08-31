@@ -768,6 +768,27 @@ class RecoveryStats:
 
     failed: int = 0
 
+
+class RecoveryFaultInjector(Protocol):
+
+    def after_stage(
+        self,
+        manifest: RecoveryManifest,
+        stage: RecoveryStage,
+    ) -> None:
+        ...
+
+
+class NoopRecoveryFaultInjector:
+
+    def after_stage(
+        self,
+        manifest: RecoveryManifest,
+        stage: RecoveryStage,
+    ) -> None:
+
+        return None
+
     deleted: int = 0
 
 
@@ -1018,6 +1039,7 @@ class RecoveryManager:
         seen_store: SeenStore | None = None,
         record_index_reader: RecordIndexReader | None = None,
         retry_policy: RetryPolicy | None = None,
+        fault_injector: RecoveryFaultInjector | None = None,
     ) -> None:
         """
         RecoveryManager 初始化。
@@ -1049,7 +1071,23 @@ class RecoveryManager:
             or RetryPolicy()
         )
 
+        self.fault_injector = (
+            fault_injector
+            or NoopRecoveryFaultInjector()
+        )
+
         self.stats = RecoveryStats()
+
+    def _after_stage(
+        self,
+        manifest: RecoveryManifest,
+        stage: RecoveryStage,
+    ) -> None:
+
+        self.fault_injector.after_stage(
+            manifest,
+            stage,
+        )
 
     def recover_all(
         self,
@@ -1403,6 +1441,11 @@ class RecoveryManager:
                     )
                 )
 
+                self._after_stage(
+                    manifest,
+                    "uploaded",
+                )
+
                 if upload.status != "verified":
 
                     raise RuntimeError(
@@ -1417,6 +1460,11 @@ class RecoveryManager:
                             upload.remote_path
                         ),
                     )
+                )
+
+                self._after_stage(
+                    manifest,
+                    "verified",
                 )
 
             # =================================================
@@ -1462,6 +1510,11 @@ class RecoveryManager:
                             upload.remote_path
                         ),
                     )
+                )
+
+                self._after_stage(
+                    manifest,
+                    "verified",
                 )
 
             # =================================================
@@ -1525,6 +1578,11 @@ class RecoveryManager:
                 )
 
                 catalog_registered_this_run = True              
+
+                self._after_stage(
+                    manifest,
+                    "catalog_registered",
+                )
 
             # =================================================
             # 5. catalog_registered -> SeenStore
@@ -1649,6 +1707,11 @@ class RecoveryManager:
                     )
                 )
 
+                self._after_stage(
+                    manifest,
+                    "seen_committed",
+                )
+
             # =================================================
             # 6. seen_committed
             # =================================================
@@ -1665,6 +1728,11 @@ class RecoveryManager:
                     )
                 )
 
+                self._after_stage(
+                    manifest,
+                    "checkpoint_committed",
+                )
+
             # =================================================
             # 7. checkpoint_committed -> cleanable
             # =================================================
@@ -1679,6 +1747,11 @@ class RecoveryManager:
                         manifest.manifest_id,
                         "cleanable",
                     )
+                )
+
+                self._after_stage(
+                    manifest,
+                    "cleanable",
                 )
 
             # =================================================

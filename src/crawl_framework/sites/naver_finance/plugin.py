@@ -616,6 +616,15 @@ class NaverFinancePlugin(
 
                 continue
 
+            if code.upper().startswith(
+                "XKRX:"
+            ):
+
+                code = code.split(
+                    ":",
+                    1,
+                )[1].strip()
+
             if code in seen:
 
                 continue
@@ -1265,6 +1274,12 @@ class NaverFinancePlugin(
                 "Naver instrument code "
                 "cannot be empty"
             )
+
+        if code.upper().startswith(
+            "XKRX:"
+        ):
+
+            return code
 
         return (
             f"XKRX:{code}"

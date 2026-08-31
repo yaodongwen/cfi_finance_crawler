@@ -17,6 +17,7 @@ from zoneinfo import (
     ZoneInfoNotFoundError,
 )
 from pathlib import Path
+from time import perf_counter
 from typing import (
     Iterable,
     Sequence,
@@ -157,6 +158,42 @@ class QueryStats:
     rows_read: int
 
     rows_returned: int
+
+
+@dataclass(
+    slots=True,
+)
+class StreamingQueryStats:
+    """
+    流式查询可观测性统计。
+
+    candidate_physical_rows 来自 Catalog row_count，
+    表示候选文件物理行数，不等同于 Arrow 实际返回行数。
+    """
+
+    catalog_sql_calls: int = 0
+
+    catalog_files: int = 0
+
+    parquet_files_materialized: int = 0
+
+    parquet_files_read: int = 0
+
+    candidate_physical_rows: int = 0
+
+    rows_yielded: int = 0
+
+    bytes_materialized: int = 0
+
+    batches_yielded: int = 0
+
+    query_duration_seconds: float = 0.0
+
+    catalog_duration_seconds: float = 0.0
+
+    materialization_duration_seconds: float = 0.0
+
+    scan_duration_seconds: float = 0.0
 
 
 # ============================================================
@@ -1659,6 +1696,7 @@ class CatalogParquetReader:
         *,
         batch_size: int = 65_536,
         max_rows: int | None = None,
+        stats: StreamingQueryStats | None = None,
     ):
         """
         流式读取符合 QuerySpec 的数据。
@@ -1720,6 +1758,14 @@ class CatalogParquetReader:
             spec
         )
 
+        query_started_at = (
+            perf_counter()
+        )
+
+        catalog_started_at = (
+            perf_counter()
+        )
+
         candidates = (
             list_candidate_files(
                 catalog=self.catalog,
@@ -1727,7 +1773,36 @@ class CatalogParquetReader:
             )
         )
 
+        if stats is not None:
+
+            stats.catalog_sql_calls += 1
+
+            stats.catalog_duration_seconds += (
+                perf_counter()
+                -
+                catalog_started_at
+            )
+
+            stats.catalog_files = len(
+                candidates
+            )
+
+            stats.candidate_physical_rows = sum(
+                int(
+                    item.row_count
+                )
+                for item in candidates
+            )
+
         if not candidates:
+
+            if stats is not None:
+
+                stats.query_duration_seconds += (
+                    perf_counter()
+                    -
+                    query_started_at
+                )
 
             return
 
@@ -1755,7 +1830,19 @@ class CatalogParquetReader:
                     rows_yielded >= max_rows
                 ):
 
+                    if stats is not None:
+
+                        stats.query_duration_seconds += (
+                            perf_counter()
+                            -
+                            query_started_at
+                        )
+
                     return
+
+                materialization_started_at = (
+                    perf_counter()
+                )
 
                 local_path = (
                     self.resolver.materialize(
@@ -1764,12 +1851,38 @@ class CatalogParquetReader:
                     )
                 )
 
+                if stats is not None:
+
+                    stats.parquet_files_materialized += 1
+
+                    stats.materialization_duration_seconds += (
+                        perf_counter()
+                        -
+                        materialization_started_at
+                    )
+
+                    try:
+
+                        stats.bytes_materialized += (
+                            local_path
+                            .stat()
+                            .st_size
+                        )
+
+                    except OSError:
+
+                        pass
+
                 dataset = ds.dataset(
                     str(
                         local_path
                     ),
                     format="parquet",
                 )
+
+                if stats is not None:
+
+                    stats.parquet_files_read += 1
 
                 scanner = dataset.scanner(
                     columns=list(
@@ -1778,6 +1891,10 @@ class CatalogParquetReader:
                     filter=dataset_filter,
                     batch_size=batch_size,
                     use_threads=True,
+                )
+
+                scan_started_at = (
+                    perf_counter()
                 )
 
                 for batch in (
@@ -1794,6 +1911,14 @@ class CatalogParquetReader:
                             batch.num_rows
                         )
 
+                        if stats is not None:
+
+                            stats.rows_yielded += (
+                                batch.num_rows
+                            )
+
+                            stats.batches_yielded += 1
+
                         yield batch
 
                         continue
@@ -1806,6 +1931,20 @@ class CatalogParquetReader:
 
                     if remaining < 1:
 
+                        if stats is not None:
+
+                            stats.scan_duration_seconds += (
+                                perf_counter()
+                                -
+                                scan_started_at
+                            )
+
+                            stats.query_duration_seconds += (
+                                perf_counter()
+                                -
+                                query_started_at
+                            )
+
                         return
 
                     if (
@@ -1817,6 +1956,14 @@ class CatalogParquetReader:
                         rows_yielded += (
                             batch.num_rows
                         )
+
+                        if stats is not None:
+
+                            stats.rows_yielded += (
+                                batch.num_rows
+                            )
+
+                            stats.batches_yielded += 1
 
                         yield batch
 
@@ -1833,6 +1980,14 @@ class CatalogParquetReader:
                             limited_batch.num_rows
                         )
 
+                        if stats is not None:
+
+                            stats.rows_yielded += (
+                                limited_batch.num_rows
+                            )
+
+                            stats.batches_yielded += 1
+
                         yield limited_batch
 
                     if (
@@ -1841,4 +1996,34 @@ class CatalogParquetReader:
                         max_rows
                     ):
 
+                        if stats is not None:
+
+                            stats.scan_duration_seconds += (
+                                perf_counter()
+                                -
+                                scan_started_at
+                            )
+
+                            stats.query_duration_seconds += (
+                                perf_counter()
+                                -
+                                query_started_at
+                            )
+
                         return
+
+                if stats is not None:
+
+                    stats.scan_duration_seconds += (
+                        perf_counter()
+                        -
+                        scan_started_at
+                    )
+
+        if stats is not None:
+
+            stats.query_duration_seconds += (
+                perf_counter()
+                -
+                query_started_at
+            )

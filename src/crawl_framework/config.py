@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import (
+    dataclass,
+    field,
+)
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from crawl_framework.core.concurrency import (
+    QueueSizeConfig,
+    StageConcurrencyConfig,
+)
 
 
 # ============================================================
@@ -77,6 +85,10 @@ class StorageConfig:
 
     max_rows: int = 50_000
 
+    target_file_size_mb: int = 256
+
+    max_buffer_age_seconds: float = 30.0
+
     compression: str = "zstd"
 
 
@@ -140,6 +152,14 @@ class FrameworkConfig:
     storage: StorageConfig
 
     sync: SyncConfig
+
+    runtime: StageConcurrencyConfig = field(
+        default_factory=StageConcurrencyConfig
+    )
+
+    queues: QueueSizeConfig = field(
+        default_factory=QueueSizeConfig
+    )
 
 
 # ============================================================
@@ -354,9 +374,27 @@ def load_config(
             )
         ).strip(),
         max_rows=int(
-            partition_raw.get(
-                "max_rows",
-                50_000,
+            storage_raw.get(
+                "max_rows_per_file",
+                partition_raw.get(
+                    "max_rows",
+                    50_000,
+                ),
+            )
+        ),
+        target_file_size_mb=int(
+            storage_raw.get(
+                "target_file_size_mb",
+                256,
+            )
+        ),
+        max_buffer_age_seconds=float(
+            storage_raw.get(
+                "max_buffer_age_seconds",
+                partition_raw.get(
+                    "max_buffer_age_seconds",
+                    30.0,
+                ),
             )
         ),
         compression=str(
@@ -415,6 +453,109 @@ def load_config(
     )
 
     # ========================================================
+    # Runtime / queues
+    # ========================================================
+
+    runtime_raw = (
+        raw.get(
+            "runtime",
+            {},
+        )
+        or {}
+    )
+
+    http_raw = (
+        raw.get(
+            "http",
+            {},
+        )
+        or {}
+    )
+
+    runtime = StageConcurrencyConfig(
+        crawl_workers=int(
+            runtime_raw.get(
+                "crawl_workers",
+                1,
+            )
+        ),
+        http_concurrency=int(
+            http_raw.get(
+                "concurrency",
+                runtime_raw.get(
+                    "http_concurrency",
+                    1,
+                ),
+            )
+        ),
+        attachment_workers=int(
+            runtime_raw.get(
+                "attachment_workers",
+                1,
+            )
+        ),
+        writer_workers=int(
+            runtime_raw.get(
+                "writer_workers",
+                1,
+            )
+        ),
+        upload_workers=int(
+            runtime_raw.get(
+                "upload_workers",
+                1,
+            )
+        ),
+        catalog_workers=int(
+            runtime_raw.get(
+                "catalog_workers",
+                1,
+            )
+        ),
+    )
+
+    queues_raw = (
+        raw.get(
+            "queues",
+            {},
+        )
+        or {}
+    )
+
+    queues = QueueSizeConfig(
+        records=int(
+            queues_raw.get(
+                "records",
+                1000,
+            )
+        ),
+        durable_files=int(
+            queues_raw.get(
+                "durable_files",
+                128,
+            )
+        ),
+        uploads=int(
+            queues_raw.get(
+                "uploads",
+                128,
+            )
+        ),
+        catalog=int(
+            queues_raw.get(
+                "catalog",
+                128,
+            )
+        ),
+        attachments=int(
+            queues_raw.get(
+                "attachments",
+                128,
+            )
+        ),
+    )
+
+    # ========================================================
     # Validate
     # ========================================================
 
@@ -428,6 +569,20 @@ def load_config(
 
         raise ConfigError(
             "storage.partition.max_rows "
+            "must be positive"
+        )
+
+    if storage.target_file_size_mb <= 0:
+
+        raise ConfigError(
+            "storage.target_file_size_mb "
+            "must be positive"
+        )
+
+    if storage.max_buffer_age_seconds <= 0:
+
+        raise ConfigError(
+            "storage.max_buffer_age_seconds "
             "must be positive"
         )
 
@@ -445,6 +600,8 @@ def load_config(
         postgres=postgres,
         storage=storage,
         sync=sync,
+        runtime=runtime,
+        queues=queues,
     )
 
 

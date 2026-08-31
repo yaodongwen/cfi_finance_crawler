@@ -1,9 +1,11 @@
 import pytest
+import requests
 
 from crawl_framework.sites.naver_finance.forum_post import (
     ForumListItem,
     NaverForumClient,
     NaverForumHTTPError,
+    NaverForumPostMissingError,
     NaverForumParseError,
     merge_forum_raw,
     parse_board_list,
@@ -99,9 +101,18 @@ class FakeSession:
                 "no fake responses left"
             )
 
-        return self.responses.pop(
+        response = self.responses.pop(
             0
         )
+
+        if isinstance(
+            response,
+            Exception,
+        ):
+
+            raise response
+
+        return response
 
 
 # ============================================================
@@ -571,6 +582,75 @@ def test_fetch_detail():
     )
 
 
+def test_fetch_detail_retries_transient_timeout():
+
+    response = FakeResponse(
+        json_data={
+            "isSuccess": True,
+            "result": {
+                "id": "321",
+                "itemCode": "005930",
+                "title": "hello",
+                "contentHtml": "body",
+            },
+        }
+    )
+
+    session = FakeSession(
+        [
+            requests.exceptions.ReadTimeout(
+                "temporary timeout"
+            ),
+            response,
+        ]
+    )
+
+    client = NaverForumClient(
+        session=session,
+        request_retries=2,
+        retry_sleep_seconds=0,
+    )
+
+    raw = client.fetch_detail(
+        "321"
+    )
+
+    assert (
+        raw["nid"]
+        == "321"
+    )
+
+    assert (
+        len(
+            session.calls
+        )
+        == 2
+    )
+
+
+def test_fetch_detail_raises_missing_for_deleted_post():
+
+    session = FakeSession(
+        [
+            FakeResponse(
+                status_code=404
+            )
+        ]
+    )
+
+    client = NaverForumClient(
+        session=session
+    )
+
+    with pytest.raises(
+        NaverForumPostMissingError
+    ):
+
+        client.fetch_detail(
+            "428617177"
+        )
+
+
 def test_http_error():
 
     session = FakeSession(
@@ -864,4 +944,81 @@ def test_crawl_pages_attaches_real_page():
         rows[1]["code"]
         == "005930"
     )
+
+
+@pytest.mark.asyncio
+async def test_crawl_pages_skips_missing_detail():
+
+    client = NaverForumClient(
+        session=FakeSession(
+            []
+        )
+    )
+
+    async def fake_page(
+        code,
+        *,
+        page=1,
+    ):
+
+        if page == 1:
+
+            return [
+                ForumListItem(
+                    nid="missing",
+                    code=code,
+                ),
+                ForumListItem(
+                    nid="present",
+                    code=code,
+                ),
+            ]
+
+        return []
+
+    async def fake_post(
+        item,
+        *,
+        fetch_detail=True,
+    ):
+
+        del fetch_detail
+
+        if item.nid == "missing":
+
+            return {}
+
+        return {
+            "nid": item.nid,
+            "code": item.code,
+        }
+
+    client.async_fetch_board_page = (
+        fake_page
+    )
+
+    client.async_fetch_post = (
+        fake_post
+    )
+
+    rows = []
+
+    async for raw in (
+        client.crawl_pages(
+            "005930",
+            max_pages=1,
+        )
+    ):
+
+        rows.append(
+            raw
+        )
+
+    assert [
+        row["nid"]
+        for row
+        in rows
+    ] == [
+        "present",
+    ]
     

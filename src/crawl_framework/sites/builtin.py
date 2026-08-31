@@ -8,6 +8,10 @@ from crawl_framework.sites.naver_finance import (
     NAVER_FINANCE_SITE_ID,
     NaverFinancePlugin,
 )
+from crawl_framework.sites.tossinvest import (
+    TOSSINVEST_SITE_ID,
+    TossInvestPlugin,
+)
 
 
 def register_builtin_sites(
@@ -19,13 +23,7 @@ def register_builtin_sites(
     所有正式 site plugin
     统一在这里注册。
 
-    后面增加：
-
-        tossinvest
-        hotcopper
-        stockhouse
-
-    时继续在这里添加。
+    hotcopper / stockhouse 后续继续在这里添加。
     """
 
     if not registry.contains(
@@ -35,4 +33,13 @@ def register_builtin_sites(
         registry.register(
             NAVER_FINANCE_SITE_ID,
             NaverFinancePlugin,
+        )
+
+    if not registry.contains(
+        TOSSINVEST_SITE_ID
+    ):
+
+        registry.register(
+            TOSSINVEST_SITE_ID,
+            TossInvestPlugin,
         )

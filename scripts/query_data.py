@@ -58,6 +58,7 @@ from crawl_framework.storage.query import (
     CatalogFileResolver,
     CatalogParquetReader,
     QuerySpec,
+    StreamingQueryStats,
 )
 
 
@@ -118,6 +119,18 @@ def parse_args() -> argparse.Namespace:
             "Multiple canonical instrument IDs. "
             "Example: --instruments "
             "XKRX:005930 XKRX:000660 XKRX:042700"
+        ),
+    )
+
+    parser.add_argument(
+        "--instruments-file",
+        default=None,
+        help=(
+            "UTF-8 text file containing one canonical "
+            "instrument ID per line. Blank lines are ignored. "
+            "Values are merged after --instrument and "
+            "--instruments, with duplicates removed while "
+            "preserving order."
         ),
     )
 
@@ -243,6 +256,149 @@ def parse_args() -> argparse.Namespace:
 
 
 # ============================================================
+# Instrument helpers
+# ============================================================
+
+
+def normalize_instrument_values(
+    values,
+) -> list[str]:
+
+    result = []
+
+    for value in values:
+
+        text = (
+            str(
+                value
+            )
+            .strip()
+        )
+
+        if not text:
+
+            continue
+
+        result.append(
+            text
+        )
+
+    return result
+
+
+def deduplicate_preserving_order(
+    values,
+) -> tuple[str, ...]:
+
+    result = []
+
+    seen = set()
+
+    for value in values:
+
+        if value in seen:
+
+            continue
+
+        seen.add(
+            value
+        )
+
+        result.append(
+            value
+        )
+
+    return tuple(
+        result
+    )
+
+
+def read_instruments_file(
+    path: str | Path,
+) -> tuple[str, ...]:
+
+    text = (
+        Path(
+            path
+        )
+        .expanduser()
+        .read_text(
+            encoding="utf-8"
+        )
+    )
+
+    return tuple(
+        normalize_instrument_values(
+            text.splitlines()
+        )
+    )
+
+
+def effective_instrument_ids(
+    args: argparse.Namespace,
+) -> tuple[str, ...] | None:
+    """
+    合并顺序：
+
+        --instrument
+        --instruments
+        --instruments-file
+
+    去重时保留第一次出现的稳定顺序。
+    """
+
+    values = []
+
+    if args.instrument is not None:
+
+        values.append(
+            args.instrument
+        )
+
+    if args.instruments:
+
+        values.extend(
+            args.instruments
+        )
+
+    file_supplied = (
+        args.instruments_file
+        is not None
+    )
+
+    if file_supplied:
+
+        values.extend(
+            read_instruments_file(
+                args.instruments_file
+            )
+        )
+
+    instruments = deduplicate_preserving_order(
+        normalize_instrument_values(
+            values
+        )
+    )
+
+    if (
+        file_supplied
+        and
+        not instruments
+    ):
+
+        raise ValueError(
+            "--instruments-file produced an empty "
+            "effective instrument set"
+        )
+
+    if not instruments:
+
+        return None
+
+    return instruments
+
+
+# ============================================================
 # Serialization
 # ============================================================
 
@@ -309,6 +465,16 @@ def print_query_header(
     print(
         "instrument =",
         args.instrument,
+    )
+
+    print(
+        "instruments =",
+        args.instruments,
+    )
+
+    print(
+        "instruments_file =",
+        args.instruments_file,
     )
 
     print(
@@ -380,6 +546,90 @@ def print_stats(
         "rows_returned =",
         stats.rows_returned,
     )
+
+
+def streaming_stats_to_dict(
+    stats: StreamingQueryStats,
+    *,
+    batch_size: int,
+    max_rows: int | None,
+) -> dict:
+
+    return {
+        "catalog_sql_calls":
+            stats.catalog_sql_calls,
+
+        "catalog_files":
+            stats.catalog_files,
+
+        "parquet_files_materialized":
+            stats.parquet_files_materialized,
+
+        "parquet_files_read":
+            stats.parquet_files_read,
+
+        "candidate_physical_rows":
+            stats.candidate_physical_rows,
+
+        "rows_yielded":
+            stats.rows_yielded,
+
+        "bytes_materialized":
+            stats.bytes_materialized,
+
+        "batches_yielded":
+            stats.batches_yielded,
+
+        "query_duration_seconds":
+            stats.query_duration_seconds,
+
+        "catalog_duration_seconds":
+            stats.catalog_duration_seconds,
+
+        "materialization_duration_seconds":
+            stats.materialization_duration_seconds,
+
+        "scan_duration_seconds":
+            stats.scan_duration_seconds,
+
+        "batch_size":
+            batch_size,
+
+        "max_rows":
+            max_rows,
+    }
+
+
+def print_stream_stats_human(
+    stats: StreamingQueryStats,
+    *,
+    batch_size: int,
+    max_rows: int | None,
+) -> None:
+
+    values = streaming_stats_to_dict(
+        stats,
+        batch_size=batch_size,
+        max_rows=max_rows,
+    )
+
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        "STREAM STATS"
+    )
+    print(
+        "========================================"
+    )
+
+    for key, value in values.items():
+
+        print(
+            f"{key} =",
+            value,
+        )
 
 
 def print_rows_human(
@@ -457,6 +707,7 @@ def print_stream_rows_human(
     batch_size: int,
     limit: int,
     max_rows: int | None,
+    stats: StreamingQueryStats | None = None,
 ) -> tuple[
     int,
     int,
@@ -487,6 +738,7 @@ def print_stream_rows_human(
         spec,
         batch_size=batch_size,
         max_rows=max_rows,
+        stats=stats,
     ):
 
         total_batches += 1
@@ -570,6 +822,7 @@ def print_stream_rows_json(
     batch_size: int,
     limit: int,
     max_rows: int | None,
+    stats: StreamingQueryStats | None = None,
 ) -> tuple[
     int,
     int,
@@ -588,6 +841,7 @@ def print_stream_rows_json(
         spec,
         batch_size=batch_size,
         max_rows=max_rows,
+        stats=stats,
     ):
 
         total_batches += 1
@@ -646,6 +900,7 @@ def export_stream_jsonl(
     output_path: Path,
     batch_size: int,
     max_rows: int | None,
+    stats: StreamingQueryStats | None = None,
 ) -> tuple[
     int,
     int,
@@ -671,6 +926,7 @@ def export_stream_jsonl(
             spec,
             batch_size=batch_size,
             max_rows=max_rows,
+            stats=stats,
         ):
 
             total_batches += 1
@@ -705,6 +961,7 @@ def export_stream_parquet(
     output_path: Path,
     batch_size: int,
     max_rows: int | None,
+    stats: StreamingQueryStats | None = None,
 ) -> tuple[
     int,
     int,
@@ -731,6 +988,7 @@ def export_stream_parquet(
             spec,
             batch_size=batch_size,
             max_rows=max_rows,
+            stats=stats,
         ):
 
             if batch.num_rows < 1:
@@ -779,6 +1037,7 @@ def export_stream(
     output_path: Path,
     batch_size: int,
     max_rows: int | None,
+    stats: StreamingQueryStats | None = None,
 ) -> tuple[
     int,
     int,
@@ -797,6 +1056,7 @@ def export_stream(
             output_path=output_path,
             batch_size=batch_size,
             max_rows=max_rows,
+            stats=stats,
         )
 
     if suffix == ".parquet":
@@ -807,6 +1067,7 @@ def export_stream(
             output_path=output_path,
             batch_size=batch_size,
             max_rows=max_rows,
+            stats=stats,
         )
 
     raise ValueError(
@@ -910,18 +1171,36 @@ def main() -> int:
             else None
         )
 
+        instruments = effective_instrument_ids(
+            args
+        )
+
         spec = QuerySpec(
             site_id=args.site,
             dataset=args.dataset,
             country=args.country,
             instrument_id=(
-                args.instrument
+                instruments[0]
+                if (
+                    instruments is not None
+                    and
+                    len(
+                        instruments
+                    )
+                    == 1
+                )
+                else None
             ),
             instrument_ids=(
-                tuple(
-                    args.instruments
+                instruments
+                if (
+                    instruments is not None
+                    and
+                    len(
+                        instruments
+                    )
+                    > 1
                 )
-                if args.instruments
                 else None
             ),
             start_date=(
@@ -945,6 +1224,8 @@ def main() -> int:
 
         if args.stream:
 
+            stream_stats = StreamingQueryStats()
+
             if args.output:
 
                 output_path = Path(
@@ -964,6 +1245,7 @@ def main() -> int:
                     max_rows=(
                         args.max_rows
                     ),
+                    stats=stream_stats,
                 )
 
                 print(
@@ -980,11 +1262,16 @@ def main() -> int:
                             "rows_returned":
                                 total_rows,
 
-                            "batch_size":
-                                args.batch_size,
-
-                            "max_rows":
-                                args.max_rows,
+                            "stream_stats":
+                                streaming_stats_to_dict(
+                                    stream_stats,
+                                    batch_size=(
+                                        args.batch_size
+                                    ),
+                                    max_rows=(
+                                        args.max_rows
+                                    ),
+                                ),
                         },
                         ensure_ascii=False,
                     )
@@ -1007,24 +1294,28 @@ def main() -> int:
                     max_rows=(
                         args.max_rows
                     ),
+                    stats=stream_stats,
                 )
 
                 print(
                     json.dumps(
                         {
-                            "_stream_stats": {
-                                "total_batches":
-                                    total_batches,
-
-                                "rows_returned":
-                                    total_rows,
-
-                                "batch_size":
-                                    args.batch_size,
-
-                                "max_rows":
-                                    args.max_rows,
-                            }
+                            "_stream_stats":
+                                {
+                                    **streaming_stats_to_dict(
+                                        stream_stats,
+                                        batch_size=(
+                                            args.batch_size
+                                        ),
+                                        max_rows=(
+                                            args.max_rows
+                                        ),
+                                    ),
+                                    "total_batches":
+                                        total_batches,
+                                    "rows_returned":
+                                        total_rows,
+                                }
                         },
                         ensure_ascii=False,
                     )
@@ -1053,32 +1344,17 @@ def main() -> int:
                 max_rows=(
                     args.max_rows
                 ),
+                stats=stream_stats,
             )
 
-            print()
-            print(
-                "========================================"
-            )
-            print(
-                "STREAM STATS"
-            )
-            print(
-                "========================================"
-            )
-
-            print(
-                "total_batches =",
-                total_batches,
-            )
-
-            print(
-                "rows_returned =",
-                total_rows,
-            )
-
-            print(
-                "max_rows =",
-                args.max_rows,
+            print_stream_stats_human(
+                stream_stats,
+                batch_size=(
+                    args.batch_size
+                ),
+                max_rows=(
+                    args.max_rows
+                ),
             )
 
             return 0
@@ -1110,10 +1386,37 @@ def main() -> int:
                         args.country,
 
                     "instrument_id":
-                        args.instrument,
+                        (
+                            instruments[0]
+                            if (
+                                instruments is not None
+                                and
+                                len(
+                                    instruments
+                                )
+                                == 1
+                            )
+                            else None
+                        ),
 
                     "instrument_ids":
-                        args.instruments,
+                        (
+                            list(
+                                instruments
+                            )
+                            if (
+                                instruments is not None
+                                and
+                                len(
+                                    instruments
+                                )
+                                > 1
+                            )
+                            else None
+                        ),
+
+                    "instruments_file":
+                        args.instruments_file,
 
                     "start_date":
                         args.start_date,

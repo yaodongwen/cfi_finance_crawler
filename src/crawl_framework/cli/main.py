@@ -9,6 +9,7 @@ from dataclasses import (
     asdict,
     dataclass,
 )
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -144,7 +145,25 @@ class CLIOptions:
         ...,
     ] | None = None
 
+    instruments_file: Path | None = None
+
     max_pages: int | None = None
+
+    crawl_workers: int | None = None
+
+    attachment_workers: int | None = None
+
+    writer_workers: int | None = None
+
+    upload_workers: int | None = None
+
+    catalog_workers: int | None = None
+
+    http_concurrency: int | None = None
+
+    target_file_size_mb: int | None = None
+
+    instrument_limit: int | None = None
 
 # ============================================================
 # Factory protocol
@@ -258,6 +277,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--instruments-file",
+        dest="instruments_file",
+        default=None,
+        help=(
+            "UTF-8 file containing one site-specific "
+            "instrument code per line. Blank lines are "
+            "ignored. Values are merged after repeated "
+            "--instrument values."
+        ),
+    )
+
+    parser.add_argument(
+        "--instrument-limit",
+        dest="instrument_limit",
+        type=int,
+        default=None,
+        help=(
+            "Use only the first N effective instruments "
+            "after merging --instrument and --instruments-file."
+        ),
+    )
+
     # ========================================================
     # Max pages
     # ========================================================
@@ -273,6 +315,29 @@ def build_parser() -> argparse.ArgumentParser:
             "Must be a positive integer."
         ),
     )
+
+    for option_name in (
+        "crawl-workers",
+        "attachment-workers",
+        "writer-workers",
+        "upload-workers",
+        "catalog-workers",
+        "http-concurrency",
+        "target-file-size-mb",
+    ):
+
+        parser.add_argument(
+            f"--{option_name}",
+            dest=option_name.replace(
+                "-",
+                "_",
+            ),
+            type=int,
+            default=None,
+            help=(
+                "Positive integer runtime override."
+            ),
+        )
 
     # ========================================================
     # Flush
@@ -345,6 +410,25 @@ def parse_args(
         - 去重
         - 保留输入顺序
     """
+
+    if argv is None:
+
+        argv = sys.argv[
+            1:
+        ]
+
+    if (
+        argv
+        and len(
+            argv
+        )
+        >= 1
+        and argv[0] == "crawl"
+    ):
+
+        argv = argv[
+            1:
+        ]
 
     parser = build_parser()
 
@@ -420,6 +504,64 @@ def parse_args(
             result
         )
 
+    def read_instruments_file(
+        path_value,
+    ) -> tuple[
+        str,
+        ...
+    ] | None:
+
+        if path_value is None:
+
+            return None
+
+        path = Path(
+            str(
+                path_value
+            ).strip()
+        ).expanduser()
+
+        if not str(
+            path
+        ):
+
+            parser.error(
+                "--instruments-file cannot be empty"
+            )
+
+        try:
+
+            text = path.read_text(
+                encoding="utf-8"
+            )
+
+        except OSError as exc:
+
+            parser.error(
+                f"--instruments-file cannot be read: {exc}"
+            )
+
+        values = [
+            line
+            for line in text.splitlines()
+            if not line.strip().startswith(
+                "#"
+            )
+        ]
+
+        normalized = normalize_repeated(
+            values
+        )
+
+        if normalized is None:
+
+            parser.error(
+                "--instruments-file did not contain "
+                "any instruments"
+            )
+
+        return normalized
+
     # ========================================================
     # Datasets
     # ========================================================
@@ -439,6 +581,44 @@ def parse_args(
             args.instruments
         )
     )
+
+    file_instruments = read_instruments_file(
+        args.instruments_file
+    )
+
+    instruments = normalize_repeated(
+        (
+            tuple(
+                instruments
+                or ()
+            )
+            +
+            tuple(
+                file_instruments
+                or ()
+            )
+        )
+    )
+
+    instrument_limit = args.instrument_limit
+
+    if instrument_limit is not None:
+
+        instrument_limit = int(
+            instrument_limit
+        )
+
+        if instrument_limit <= 0:
+
+            parser.error(
+                "--instrument-limit must be positive"
+            )
+
+        if instruments is not None:
+
+            instruments = instruments[
+                :instrument_limit
+            ]
 
     # ========================================================
     # Max pages
@@ -473,6 +653,32 @@ def parse_args(
                 "positive"
             )
 
+    def positive_optional_int(
+        name,
+    ) -> int | None:
+
+        value = getattr(
+            args,
+            name,
+        )
+
+        if value is None:
+
+            return None
+
+        value = int(
+            value
+        )
+
+        if value <= 0:
+
+            parser.error(
+                f"--{name.replace('_', '-')} "
+                "must be positive"
+            )
+
+        return value
+
     # ========================================================
     # Return
     # ========================================================
@@ -490,7 +696,36 @@ def parse_args(
             args.recovery_only
         ),
         instruments=instruments,
+        instruments_file=(
+            Path(
+                args.instruments_file
+            ).expanduser()
+            if args.instruments_file
+            else None
+        ),
         max_pages=max_pages,
+        crawl_workers=positive_optional_int(
+            "crawl_workers"
+        ),
+        attachment_workers=positive_optional_int(
+            "attachment_workers"
+        ),
+        writer_workers=positive_optional_int(
+            "writer_workers"
+        ),
+        upload_workers=positive_optional_int(
+            "upload_workers"
+        ),
+        catalog_workers=positive_optional_int(
+            "catalog_workers"
+        ),
+        http_concurrency=positive_optional_int(
+            "http_concurrency"
+        ),
+        target_file_size_mb=positive_optional_int(
+            "target_file_size_mb"
+        ),
+        instrument_limit=instrument_limit,
     )
     
 

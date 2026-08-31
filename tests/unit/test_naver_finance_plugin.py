@@ -116,6 +116,17 @@ def test_instrument_id():
     )
 
 
+def test_instrument_id_accepts_canonical_id():
+
+    assert (
+        NaverFinancePlugin
+        ._instrument_id(
+            "XKRX:005930"
+        )
+        == "XKRX:005930"
+    )
+
+
 def test_empty_instrument_rejected():
 
     with pytest.raises(
@@ -125,6 +136,36 @@ def test_empty_instrument_rejected():
         NaverFinancePlugin._instrument_id(
             ""
         )
+
+
+@pytest.mark.asyncio
+async def test_discover_accepts_canonical_instrument_ids():
+
+    plugin = NaverFinancePlugin()
+
+    scopes = [
+        scope
+        async for scope in plugin.discover(
+            "forum_post",
+            CrawlContext(
+                extra={
+                    "instrument_codes": (
+                        "XKRX:005930",
+                    )
+                }
+            ),
+        )
+    ]
+
+    assert (
+        scopes[0].source_key
+        == "005930"
+    )
+
+    assert (
+        scopes[0].scope_id
+        == "XKRX:005930"
+    )
 
 
 # ============================================================
@@ -1007,4 +1048,3 @@ def test_forum_post_content_change_changes_version_hash():
         !=
         record_new.version_hash
     )
-

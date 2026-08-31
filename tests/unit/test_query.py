@@ -15,6 +15,7 @@ from crawl_framework.storage.query import (
     CatalogFileResolver,
     CatalogParquetReader,
     QuerySpec,
+    StreamingQueryStats,
     build_parquet_filters,
     normalize_query,
 )
@@ -1970,4 +1971,381 @@ def test_iter_batches_max_rows_stops_before_next_file(
         [
             1,
         ]
+    )
+
+
+def test_iter_batches_populates_streaming_stats(
+    tmp_path,
+):
+
+    parquet_path = (
+        tmp_path
+        /
+        "stats.parquet"
+    )
+
+    table = pa.table(
+        {
+            "record_uid":
+                pa.array(
+                    [
+                        "keep-1",
+                        "drop-1",
+                        "keep-2",
+                        "drop-2",
+                    ],
+                    type=pa.string(),
+                ),
+
+            "instrument_id":
+                pa.array(
+                    [
+                        "XKRX:042700",
+                        "XKRX:005930",
+                        "XKRX:042700",
+                        "XKRX:000660",
+                    ],
+                    type=pa.string(),
+                ),
+
+            "event_time":
+                pa.array(
+                    [
+                        datetime(
+                            2026,
+                            8,
+                            26,
+                            hour,
+                            0,
+                            tzinfo=UTC,
+                        )
+                        for hour in (
+                            1,
+                            2,
+                            3,
+                            4,
+                        )
+                    ],
+                    type=pa.timestamp(
+                        "us",
+                        tz="UTC",
+                    ),
+                ),
+        }
+    )
+
+    pq.write_table(
+        table,
+        parquet_path,
+    )
+
+    item = FakeCatalogFile(
+        file_id=1,
+        file_path="stats.parquet",
+        remote_path=str(
+            parquet_path
+        ),
+        row_count=4,
+        file_size=(
+            parquet_path.stat().st_size
+        ),
+        partition_date=date(
+            2026,
+            8,
+            26,
+        ),
+    )
+
+    catalog = FakeCatalog(
+        {
+            "2026-08-26":
+                [
+                    item,
+                ],
+        }
+    )
+
+    reader = CatalogParquetReader(
+        catalog=catalog,
+        resolver=CatalogFileResolver(),
+    )
+
+    stats = StreamingQueryStats()
+
+    batches = list(
+        reader.iter_batches(
+            QuerySpec(
+                site_id="naver_finance",
+                dataset="forum_post",
+                country="KR",
+                instrument_id=(
+                    "XKRX:042700"
+                ),
+                start_date=(
+                    "2026-08-26"
+                ),
+                end_date=(
+                    "2026-08-26"
+                ),
+                timezone="UTC",
+                columns=(
+                    "record_uid",
+                    "instrument_id",
+                    "event_time",
+                ),
+            ),
+            batch_size=1,
+            stats=stats,
+        )
+    )
+
+    assert [
+        batch.num_rows
+        for batch in batches
+    ] == [
+        1,
+        1,
+    ]
+
+    assert (
+        stats.catalog_sql_calls
+        == 1
+    )
+
+    assert (
+        stats.catalog_files
+        == 1
+    )
+
+    assert (
+        stats.parquet_files_materialized
+        == 1
+    )
+
+    assert (
+        stats.parquet_files_read
+        == 1
+    )
+
+    assert (
+        stats.candidate_physical_rows
+        == 4
+    )
+
+    assert (
+        stats.rows_yielded
+        == 2
+    )
+
+    assert (
+        stats.batches_yielded
+        == 2
+    )
+
+    assert (
+        stats.bytes_materialized
+        ==
+        parquet_path.stat().st_size
+    )
+
+    assert (
+        stats.query_duration_seconds
+        >= 0
+    )
+
+
+def test_iter_batches_stats_reflect_max_rows_early_stop(
+    tmp_path,
+):
+
+    path_1 = (
+        tmp_path
+        /
+        "stats-one.parquet"
+    )
+
+    path_2 = (
+        tmp_path
+        /
+        "stats-two.parquet"
+    )
+
+    table = pa.table(
+        {
+            "record_uid":
+                pa.array(
+                    [
+                        "r1",
+                        "r2",
+                        "r3",
+                    ],
+                    type=pa.string(),
+                ),
+
+            "instrument_id":
+                pa.array(
+                    [
+                        "XKRX:042700",
+                        "XKRX:042700",
+                        "XKRX:042700",
+                    ],
+                    type=pa.string(),
+                ),
+
+            "event_time":
+                pa.array(
+                    [
+                        datetime(
+                            2026,
+                            8,
+                            26,
+                            hour,
+                            0,
+                            tzinfo=UTC,
+                        )
+                        for hour in (
+                            1,
+                            2,
+                            3,
+                        )
+                    ],
+                    type=pa.timestamp(
+                        "us",
+                        tz="UTC",
+                    ),
+                ),
+        }
+    )
+
+    pq.write_table(
+        table,
+        path_1,
+    )
+
+    pq.write_table(
+        table,
+        path_2,
+    )
+
+    item_1 = FakeCatalogFile(
+        file_id=1,
+        file_path="stats-one.parquet",
+        remote_path=str(
+            path_1
+        ),
+        row_count=3,
+        file_size=(
+            path_1.stat().st_size
+        ),
+        partition_date=date(
+            2026,
+            8,
+            26,
+        ),
+    )
+
+    item_2 = FakeCatalogFile(
+        file_id=2,
+        file_path="stats-two.parquet",
+        remote_path=str(
+            path_2
+        ),
+        row_count=3,
+        file_size=(
+            path_2.stat().st_size
+        ),
+        partition_date=date(
+            2026,
+            8,
+            26,
+        ),
+    )
+
+    catalog = FakeCatalog(
+        {
+            "2026-08-26":
+                [
+                    item_1,
+                    item_2,
+                ],
+        }
+    )
+
+    resolver = TrackingResolver()
+
+    reader = CatalogParquetReader(
+        catalog=catalog,
+        resolver=resolver,
+    )
+
+    stats = StreamingQueryStats()
+
+    batches = list(
+        reader.iter_batches(
+            QuerySpec(
+                site_id="naver_finance",
+                dataset="forum_post",
+                country="KR",
+                instrument_id=(
+                    "XKRX:042700"
+                ),
+                start_date=(
+                    "2026-08-26"
+                ),
+                end_date=(
+                    "2026-08-26"
+                ),
+                timezone="UTC",
+                columns=(
+                    "record_uid",
+                    "event_time",
+                ),
+            ),
+            batch_size=10,
+            max_rows=2,
+            stats=stats,
+        )
+    )
+
+    assert sum(
+        batch.num_rows
+        for batch in batches
+    ) == 2
+
+    assert (
+        resolver.materialized_ids
+        ==
+        [
+            1,
+        ]
+    )
+
+    assert (
+        stats.catalog_files
+        == 2
+    )
+
+    assert (
+        stats.candidate_physical_rows
+        == 6
+    )
+
+    assert (
+        stats.parquet_files_materialized
+        == 1
+    )
+
+    assert (
+        stats.parquet_files_read
+        == 1
+    )
+
+    assert (
+        stats.rows_yielded
+        == 2
+    )
+
+    assert (
+        stats.batches_yielded
+        == 1
     )

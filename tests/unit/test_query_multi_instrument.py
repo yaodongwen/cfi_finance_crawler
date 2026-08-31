@@ -15,8 +15,13 @@ from crawl_framework.storage.query import (
     CatalogFileResolver,
     CatalogParquetReader,
     QuerySpec,
+    StreamingQueryStats,
     instrument_buckets,
     normalize_query,
+)
+from crawl_framework.storage.scale import (
+    QueryScaleObservation,
+    assert_catalog_sql_not_per_instrument,
 )
 
 
@@ -597,4 +602,164 @@ def test_multi_instrument_query_reads_only_requested_instruments(
         "5f",
         "20",
     }
+
+
+def test_large_universe_uses_single_catalog_query_for_100_instruments():
+
+    instruments = tuple(
+        f"XKRX:{number:06d}"
+        for number in range(
+            100
+        )
+    )
+
+    catalog = FakeCatalog(
+        {}
+    )
+
+    reader = CatalogParquetReader(
+        catalog=catalog,
+        resolver=CatalogFileResolver(),
+    )
+
+    stats = StreamingQueryStats()
+
+    list(
+        reader.iter_batches(
+            QuerySpec(
+                site_id="naver_finance",
+                dataset="forum_post",
+                country="KR",
+                instrument_ids=instruments,
+                start_date="2026-08-26",
+                end_date="2026-08-26",
+                timezone="UTC",
+                columns=(
+                    "record_uid",
+                    "instrument_id",
+                    "event_time",
+                ),
+            ),
+            stats=stats,
+        )
+    )
+
+    assert len(
+        catalog.calls
+    ) == 1
+
+    call = catalog.calls[0]
+
+    assert (
+        call["method"]
+        ==
+        "range_multi_bucket"
+    )
+
+    observation = QueryScaleObservation(
+        instrument_count=len(
+            instruments
+        ),
+        unique_bucket_count=len(
+            call["buckets"]
+        ),
+        catalog_sql_calls=(
+            stats.catalog_sql_calls
+        ),
+        catalog_files=(
+            stats.catalog_files
+        ),
+        candidate_physical_rows=(
+            stats.candidate_physical_rows
+        ),
+        rows_yielded=(
+            stats.rows_yielded
+        ),
+    )
+
+    assert_catalog_sql_not_per_instrument(
+        observation
+    )
+
+
+def test_large_universe_uses_single_catalog_query_for_1000_instruments():
+
+    instruments = tuple(
+        f"XKRX:{number:06d}"
+        for number in range(
+            1000
+        )
+    )
+
+    catalog = FakeCatalog(
+        {}
+    )
+
+    reader = CatalogParquetReader(
+        catalog=catalog,
+        resolver=CatalogFileResolver(),
+    )
+
+    stats = StreamingQueryStats()
+
+    list(
+        reader.iter_batches(
+            QuerySpec(
+                site_id="naver_finance",
+                dataset="forum_post",
+                country="KR",
+                instrument_ids=instruments,
+                start_date="2026-08-26",
+                end_date="2026-08-26",
+                timezone="UTC",
+                columns=(
+                    "record_uid",
+                    "instrument_id",
+                    "event_time",
+                ),
+            ),
+            stats=stats,
+        )
+    )
+
+    assert len(
+        catalog.calls
+    ) == 1
+
+    call = catalog.calls[0]
+
+    assert (
+        call["method"]
+        ==
+        "range_multi_bucket"
+    )
+
+    assert len(
+        call["buckets"]
+    ) <= 256
+
+    observation = QueryScaleObservation(
+        instrument_count=len(
+            instruments
+        ),
+        unique_bucket_count=len(
+            call["buckets"]
+        ),
+        catalog_sql_calls=(
+            stats.catalog_sql_calls
+        ),
+        catalog_files=(
+            stats.catalog_files
+        ),
+        candidate_physical_rows=(
+            stats.candidate_physical_rows
+        ),
+        rows_yielded=(
+            stats.rows_yielded
+        ),
+    )
+
+    assert_catalog_sql_not_per_instrument(
+        observation
+    )
     

@@ -748,6 +748,115 @@ def test_duplicate_instruments_removed():
     )
 
 
+def test_instruments_file_appends_after_instruments(
+    tmp_path,
+):
+
+    path = (
+        tmp_path
+        / "instruments.txt"
+    )
+
+    path.write_text(
+        "000660\n\n005930\n042700\n",
+        encoding="utf-8",
+    )
+
+    options = parse_args(
+        [
+            "--site",
+            "naver_finance",
+            "--instrument",
+            "005930",
+            "--instruments-file",
+            str(
+                path
+            ),
+        ]
+    )
+
+    assert (
+        options.instruments
+        == (
+            "005930",
+            "000660",
+            "042700",
+        )
+    )
+
+    assert (
+        options.instruments_file
+        == path
+    )
+
+
+def test_instruments_file_rejects_empty_file(
+    tmp_path,
+):
+
+    path = (
+        tmp_path
+        / "empty.txt"
+    )
+
+    path.write_text(
+        "\n  \n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        SystemExit
+    ):
+
+        parse_args(
+            [
+                "--site",
+                "naver_finance",
+                "--instruments-file",
+                str(
+                    path
+                ),
+            ]
+        )
+
+
+def test_instruments_file_ignores_snapshot_comments(
+    tmp_path,
+):
+
+    path = (
+        tmp_path
+        / "universe.txt"
+    )
+
+    path.write_text(
+        "# crawl_framework rollout universe snapshot\n"
+        "# metadata: {\"count\": 2}\n"
+        "XKRX:005930\n"
+        "XKRX:000660\n",
+        encoding="utf-8",
+    )
+
+    options = parse_args(
+        [
+            "--site",
+            "naver_finance",
+            "--instruments-file",
+            str(
+                path
+            ),
+        ]
+    )
+
+    assert (
+        options.instruments
+        == (
+            "XKRX:005930",
+            "XKRX:000660",
+        )
+    )
+
+
 def test_instrument_whitespace_removed():
 
     options = parse_args(
@@ -865,5 +974,164 @@ def test_parse_max_pages_rejects_negative():
                 "naver_finance",
                 "--max-pages",
                 "-2",
+            ]
+        )
+
+
+def test_parse_generic_runtime_overrides():
+
+    options = parse_args(
+        [
+            "--site",
+            "naver_finance",
+            "--crawl-workers",
+            "32",
+            "--attachment-workers",
+            "8",
+            "--writer-workers",
+            "2",
+            "--upload-workers",
+            "4",
+            "--catalog-workers",
+            "3",
+            "--http-concurrency",
+            "64",
+            "--target-file-size-mb",
+            "128",
+        ]
+    )
+
+    assert (
+        options.crawl_workers
+        == 32
+    )
+
+    assert (
+        options.attachment_workers
+        == 8
+    )
+
+    assert (
+        options.writer_workers
+        == 2
+    )
+
+    assert (
+        options.upload_workers
+        == 4
+    )
+
+    assert (
+        options.catalog_workers
+        == 3
+    )
+
+    assert (
+        options.http_concurrency
+        == 64
+    )
+
+    assert (
+        options.target_file_size_mb
+        == 128
+    )
+
+
+def test_parse_crawl_subcommand_is_supported():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "forum_post",
+        ]
+    )
+
+    assert (
+        options.site
+        == "naver_finance"
+    )
+
+    assert (
+        options.datasets
+        == (
+            "forum_post",
+        )
+    )
+
+
+def test_parse_instrument_limit_uses_effective_prefix(
+    tmp_path,
+):
+
+    path = (
+        tmp_path
+        / "universe.txt"
+    )
+
+    path.write_text(
+        "XKRX:005930\nXKRX:000660\nXKRX:042700\n",
+        encoding="utf-8",
+    )
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--instruments-file",
+            str(
+                path
+            ),
+            "--instrument-limit",
+            "2",
+        ]
+    )
+
+    assert (
+        options.instruments
+        == (
+            "XKRX:005930",
+            "XKRX:000660",
+        )
+    )
+
+    assert (
+        options.instrument_limit
+        == 2
+    )
+
+
+def test_parse_instrument_limit_rejects_zero():
+
+    with pytest.raises(
+        SystemExit
+    ):
+
+        parse_args(
+            [
+                "crawl",
+                "--site",
+                "naver_finance",
+                "--instrument-limit",
+                "0",
+            ]
+        )
+
+
+def test_parse_generic_runtime_overrides_reject_zero():
+
+    with pytest.raises(
+        SystemExit
+    ):
+
+        parse_args(
+            [
+                "--site",
+                "naver_finance",
+                "--crawl-workers",
+                "0",
             ]
         )

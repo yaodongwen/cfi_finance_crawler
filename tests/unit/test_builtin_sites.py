@@ -9,6 +9,9 @@ from crawl_framework.sites.builtin import (
 from crawl_framework.sites.naver_finance import (
     NaverFinancePlugin,
 )
+from crawl_framework.sites.tossinvest import (
+    TossInvestPlugin,
+)
 
 
 def test_register_builtin_sites():
@@ -27,6 +30,12 @@ def test_register_builtin_sites():
         )
     )
 
+    assert (
+        registry.contains(
+            "tossinvest"
+        )
+    )
+
     plugin = registry.create(
         "naver_finance"
     )
@@ -34,6 +43,15 @@ def test_register_builtin_sites():
     assert isinstance(
         plugin,
         NaverFinancePlugin,
+    )
+
+    toss = registry.create(
+        "tossinvest"
+    )
+
+    assert isinstance(
+        toss,
+        TossInvestPlugin,
     )
 
 
@@ -55,5 +73,6 @@ def test_builtin_registration_is_idempotent():
         registry.list_sites()
         == (
             "naver_finance",
+            "tossinvest",
         )
     )

@@ -16,12 +16,17 @@ from crawl_framework.sites.naver_finance.plugin import (
     NaverFinancePlugin,
 )
 
+from crawl_framework.sites.naver_finance.adapter import (
+    NaverFinanceAdapter,
+)
+
 
 __all__ = [
     "ForumListItem",
     "NAVER_FINANCE_COUNTRY",
     "NAVER_FINANCE_SITE_ID",
     "NAVER_FINANCE_TIMEZONE",
+    "NaverFinanceAdapter",
     "NaverFinancePlugin",
     "NaverForumClient",
     "NaverForumError",

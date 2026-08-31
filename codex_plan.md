@@ -1,180 +1,216 @@
-# Crawl Framework V2 — Codex Continuation Plan
+# Crawl Framework V2 — Codex Master Execution Plan
 
-> Purpose: This document is the authoritative handoff for continuing development of the universal financial web crawler / storage / query framework.
+> **This file is the authoritative execution plan.**
 >
-> Codex should follow this document in order, preserve all existing working behavior, and never replace proven semantics with speculative redesigns.
+> Codex MUST follow the execution order in **Section 3 — Execution Roadmap**.
 >
-> Current validated baseline: **392 unit tests passed**.
+> All later sections are **technical specifications for the corresponding roadmap item**.
+> They are NOT independent "next tasks" and MUST NOT override the roadmap order.
 >
-> Envirnmnet: 
-```bash
-conda activate pac
-```
+> Actual repository code + tests are the factual source of truth.
+> `PROJECT_STATUS.md` records current progress.
+>
+> If this file, `PROJECT_STATUS.md`, and the repository disagree:
+> 1. inspect the real code and tests;
+> 2. identify whether work was already completed;
+> 3. preserve verified newer behavior;
+> 4. update `PROJECT_STATUS.md`;
+> 5. continue from the first genuinely incomplete roadmap item.
+
 ---
 
-## 0. Executive Summary
+# 1. Project Mission
 
-This project is a reusable, multi-site financial data crawling and storage framework.
+Build a reusable, recoverable, auditable, scalable financial web crawling, storage, and query framework for multiple sites and countries.
 
-The intended long-term workflow is:
-
-```text
-site-specific crawler/plugin
-        ↓
-normalize into CanonicalRecord
-        ↓
-SeenStore inspect
-        ↓
-buffer
-        ↓
-atomic local Parquet write
-        ↓
-sidecar / manifest
-        ↓
-upload
-        ↓
-remote verification
-        ↓
-PostgreSQL Catalog registration
-        ↓
-SeenStore commit
-        ↓
-checkpoint commit
-        ↓
-local cleanup
-        ↓
-query through Catalog + Parquet
-```
-
-Target data sources include:
+Target sites include:
 
 - Naver Finance
 - TossInvest
 - HotCopper
 - Stockhouse
-- future country-specific finance/news/community/research sources
+- future financial/news/community/research sources
 
-Target datasets include:
+Target long-term scale may reach billions of comments/posts.
 
-- `news_article`
-- `news_instrument`
-- `forum_post`
-- `comment`
-- `research_report`
-- `research_instrument`
-- `author_profile`
-- `author_post`
-- `holding_snapshot`
-- `holding_position`
-- `instrument`
-- `instrument_relation`
-- `attachment`
+Core architecture:
 
-The framework is designed for very large datasets, potentially billions of comments.
+```text
+site-specific plugin
+    ↓
+crawl / discover
+    ↓
+normalize CanonicalRecord
+    ↓
+SeenStore inspect
+    ↓
+buffer
+    ↓
+atomic local Parquet
+    ↓
+sidecar / manifest
+    ↓
+upload
+    ↓
+verify
+    ↓
+PostgreSQL Catalog
+    ↓
+SeenStore commit
+    ↓
+checkpoint commit
+    ↓
+cleanup
+    ↓
+Catalog + Parquet Query Layer
+```
 
-Core storage strategy:
+Main durable data:
+- Parquet on remote storage/NAS
 
-- PostgreSQL for Catalog / metadata / control state
-- Parquet for large durable analytical data
-- remote NAS / server for long-term storage
-- small local disk footprint
-- stream/query by partition + bucket
-- no SQLite as main database
-- SQLite is acceptable only for SeenStore/cache-like local state
+Control/catalog data:
+- PostgreSQL
+
+Local-only cache/history:
+- SQLite acceptable only for SeenStore/cache-like purposes
 
 ---
 
-# 1. Current Project Structure
+# 2. Current Proven Baseline
+
+Current confirmed baseline:
 
 ```text
-crawl_framework/
-  config/
-    config.yaml
+396 unit tests passed
+```
 
-  src/crawl_framework/
-    config.py
+Known completed capabilities include:
 
-    core/
-      models.py
-      dataset.py
-      plugin.py
-      registry.py
-      pipeline.py
-      runtime.py
-      barrier.py
-      bootstrap.py
+- CanonicalRecord identity/version semantics
+- SeenStore inspect/commit
+- checkpoint durable barrier
+- Parquet partitioning
+- PostgreSQL Catalog
+- `storage_status` vs `lifecycle_status`
+- active/uploaded filtering
+- lifecycle compaction semantics
+- single-instrument query
+- multi-instrument query
+- timezone-aware local-natural-day query
+- UTC partition pruning
+- bucket pruning
+- multi-bucket single-SQL lookup
+- Arrow predicate pushdown
+- streaming RecordBatch query
+- hard `max_rows` stop
+- JSONL output/export
+- streaming Parquet export
+- Naver production smoke tests
 
-    storage/
-      buffer.py
-      seen_store.py
-      checkpoint.py
-      partition.py
-      parquet_writer.py
-      postgres.py
-      postgres_connection.py
-      uploader.py
-      cleaner.py
-      recovery.py
-      record_index.py
-      retry_policy.py
-      recovery_orchestrator.py
-      query.py
+Known production multi-instrument query:
 
-    transports/
-      http.py
-      playwright.py
-      proxy.py
-      rate_limit.py
+```text
+XKRX:000660
+XKRX:005930
+XKRX:042700
 
-    sites/
-      builtin.py
-      naver_finance/
-        __init__.py
-        plugin.py
-        forum_post.py
+113 rows
+```
 
-    cli/
-      __init__.py
-      main.py
+Current Phase A result:
 
-    app_factory.py
+```text
+A1 UPSERT physical-state regression fix   DONE
+A2 regression tests                       DONE
+A3 full unit validation                   DONE
 
-  scripts/
-    repair_remote_catalog.py
-    migrate_seen_forum_post_hashes.py
-    compact_naver_forum_post_history.py
-    migrate_seen_forum_post_local_history.py
-    publish_naver_forum_post_compaction.py
-    retire_naver_forum_post_history.py
-    migrate_data_files_lifecycle_status.py
-    query_data.py
-
-  tests/
-    unit/
-      test_query.py
-      test_query_multi_instrument.py
-      test_postgres.py
-      ...
-
-  state/
-  spool/
-  warehouse/
-  remote/
-  tmp/
-  logs/
+Current baseline: 396 passed
 ```
 
 ---
 
-# 2. Non-Negotiable Architecture Rules
+# 3. EXECUTION ROADMAP — THE ONLY AUTHORITATIVE ORDER
 
-These rules must not be violated without explicit redesign and new tests.
+Codex MUST determine the next task from this section plus `PROJECT_STATUS.md`.
 
-## 2.1 Canonical identity
+Do NOT infer execution order from later section numbers or headings.
 
-`record_uid` is the logical record identity.
+```text
+PHASE A — Core correctness
+  A1. Fix PostgreSQL UPSERT physical-state regression
+  A2. Add regression tests
+  A3. Run full unit suite
 
-Current intended formula:
+PHASE B — Query operational maturity
+  B1. Streaming/query observability
+  B2. Large universe input
+  B3. Production query smoke tests
+
+PHASE C — Storage maintenance
+  C1. Generic compaction
+  C2. Generic storage audit
+  C3. Safe repair workflows
+  C4. Retention/cleanup policy
+
+PHASE D — Recovery robustness
+  D1. Fault-injection tests
+  D2. Recovery idempotency
+  D3. Crash-boundary validation
+
+PHASE E — Scale validation
+  E1. 100/1000-instrument query tests
+  E2. Memory testing
+  E3. File-size / compaction tuning
+  E4. Longer production runs
+
+PHASE F — Architecture proof
+  F1. Second-site integration
+  F2. Verify core remains unchanged
+  F3. Production smoke test
+
+PHASE G — Rollout
+  G1. 50 instruments
+  G2. 500 instruments
+  G3. Full market
+  G4. Monitor and tune
+```
+
+## 3.1 Execution rule
+
+At startup:
+
+1. Read this file.
+2. Read `PROJECT_STATUS.md`.
+3. Run `git status --short`.
+4. Run `pytest -q tests/unit`.
+5. Compare repository reality with `PROJECT_STATUS.md`.
+6. Find the **first incomplete item in Section 3**.
+7. Work on that item only until its acceptance criteria are met.
+8. Update `PROJECT_STATUS.md`.
+9. Continue automatically to the next roadmap item unless a stop condition is triggered.
+
+## 3.2 Stop conditions
+
+Stop and ask the user only when:
+
+- production data may be deleted or overwritten;
+- a destructive/irreversible DB migration is required;
+- real NAS data may be modified destructively;
+- tests expose a major architecture ambiguity;
+- repository state conflicts materially with this plan and no clear backward-compatible path exists;
+- credentials/secrets or unavailable external infrastructure are required.
+
+Normal code changes, tests, refactors, CLI additions, query/storage/recovery work do NOT require user confirmation.
+
+---
+
+# 4. Non-Negotiable Architecture Rules
+
+## 4.1 Canonical identity
+
+`record_uid` = logical identity.
+
+Conceptual formula:
 
 ```text
 stable_sha256(
@@ -186,210 +222,95 @@ stable_sha256(
 )
 ```
 
-`version_hash` represents record content/version.
+`version_hash` represents meaningful record version/content.
 
-It excludes crawl timestamp and includes canonical business fields such as:
+Do not include unstable page number, crawl timestamp, view count, etc. unless intentionally part of version semantics.
 
-```text
-site_id
-dataset
-source_id
-scope_type
-scope_id
-instrument_id
-event_time
-updated_at
-title
-content
-author_id
-author_name
-source_url
-relations
-payload
-```
+## 4.2 SeenStore vs checkpoint
 
-Never include unstable page-position or crawl-time-only values in identity hashes.
+SeenStore:
+- durable record/version history
 
----
+Checkpoint:
+- crawler progress
 
-## 2.2 SeenStore semantics
+Never commit either before durable storage success.
 
-SeenStore is not a crawler checkpoint.
+## 4.3 Durable barrier
 
-- SeenStore = durable record/version history
-- Checkpoint = crawler progress
-
-Required behavior:
-
-```text
-inspect()
-    new / unchanged / updated
-
-commit()
-    only after durable storage success
-```
-
-Never commit SeenStore merely because a record was crawled.
-
----
-
-## 2.3 Durable commit barrier
-
-Correct order:
+Required order:
 
 ```text
 crawl
 → normalize
-→ SeenStore inspect
+→ Seen inspect
 → buffer
 → local Parquet atomic write
 → sidecar
 → manifest
 → upload
 → verify
-→ PostgreSQL Catalog
-→ SeenStore commit
+→ Catalog
+→ Seen commit
 → checkpoint
 → cleanup
 ```
 
-Desired semantics:
+## 4.4 Catalog state
 
-```text
-at-least-once crawling
-+
-effectively-once durable storage
-```
-
-Do not move checkpoint or SeenStore commits before durable storage verification.
-
----
-
-## 2.4 Lifecycle vs physical storage state
-
-`marketdata.data_files` separates:
-
-### Physical storage state
+Physical:
 
 ```text
 storage_status:
-    local
-    uploaded
+  local
+  uploaded
 ```
 
-### Logical lifecycle state
+Logical:
 
 ```text
 lifecycle_status:
-    active
-    superseded
-    archived
+  active
+  superseded
+  archived
 ```
 
-Normal queries must only use:
+Normal query:
 
 ```sql
 storage_status = 'uploaded'
 AND lifecycle_status = 'active'
 ```
 
-Never treat lifecycle and storage state as the same thing.
-
 ---
 
-# 3. Current Proven Baseline
+# 5. Query Semantics That Must Be Preserved
 
-Current unit-test baseline:
+## 5.1 Instrument query
 
-```text
-392 passed
-```
-
-Do not accept future changes that reduce this without a clearly justified test update.
-
-The following production behavior has been validated.
-
-## 3.1 Naver forum_post
-
-Real instruments tested:
-
-```text
-XKRX:005930
-XKRX:000660
-XKRX:042700
-```
-
-Current known bucket mapping:
-
-```text
-XKRX:005930 -> 5f
-XKRX:042700 -> 20
-XKRX:000660 -> f1
-```
-
-Bucket function uses stable SHA-1 based partition logic from `storage/partition.py`.
-
----
-
-## 3.2 Current compacted active history
-
-Production compacted history was previously validated at 123 logical rows.
-
-Lifecycle semantics were established:
-
-```text
-old files -> superseded
-replacement compacted files -> active
-```
-
-Normal Catalog queries must never re-read superseded files.
-
----
-
-## 3.3 Query Layer currently supports
-
-- single instrument query
-- multi-instrument query
-- local-natural-day timezone semantics
-- UTC partition pruning
-- single-bucket pruning
-- multi-bucket pruning
-- date-range Catalog queries
-- Arrow predicate pushdown
-- streaming Arrow `RecordBatch`
-- hard `max_rows` early termination
-- JSON Lines streaming
-- JSONL export
-- Parquet streaming export
-- normal small query returning full `pa.Table`
-- stable sort in full-table query
-- no guaranteed global sort in streaming mode
-
----
-
-# 4. Query Semantics — Must Preserve
-
-## 4.1 QuerySpec
-
-Current query layer supports both:
+Support:
 
 ```text
 instrument_id
 instrument_ids
 ```
 
-Rules:
+Single-instrument behavior must remain backward compatible.
 
-- single-instrument behavior must remain backward compatible
-- multi-instrument input must be normalized and deduplicated
-- requested instrument rows must still be filtered exactly at Arrow level
-- bucket pruning is only a coarse file-level optimization
+Multi-instrument:
+- strip
+- deduplicate
+- preserve stable input order
+- compute stable buckets
+- deduplicate buckets
+- Catalog pruning by bucket(s)
+- exact Arrow filtering by requested instrument IDs
 
----
+Bucket pruning is coarse file-level pruning only.
 
-## 4.2 Timezone semantics
+## 5.2 Timezone semantics
 
-User-facing date inputs are local natural dates.
+User dates are local natural dates.
 
 Example:
 
@@ -398,282 +319,103 @@ timezone = Asia/Seoul
 date = 2026-08-26
 ```
 
-must map to:
+means:
 
 ```text
 >= 2026-08-25 15:00:00 UTC
 <  2026-08-26 15:00:00 UTC
 ```
 
-Partition pruning must derive UTC physical partition dates from this interval.
+UTC physical partition pruning must be derived from this interval.
 
-Do not interpret local dates as UTC dates.
+## 5.3 Full vs streaming query
 
----
+`query()`:
+- full `pa.Table`
+- suitable for small/interactive query
+- stable global sort by `event_time`, then `record_uid` when available
 
-## 4.3 Full query vs streaming query
+`iter_batches()`:
+- streaming `RecordBatch`
+- bounded memory
+- no global cross-file sort guarantee
+- supports `max_rows`
 
-### `query()`
+## 5.4 CLI semantics
 
-Use for small/interactive results.
+`--limit`:
+- display/output limit only
 
-Behavior:
+`--max-rows`:
+- hard execution limit
+- stop scanning further once reached
 
-```text
-returns full pa.Table
-may concatenate files
-global stable sort:
-    event_time ascending
-    then record_uid ascending when available
-```
-
-### `iter_batches()`
-
-Use for large result sets.
-
-Behavior:
-
-```text
-returns RecordBatch stream
-constant-bounded memory
-no cross-file global sorting guarantee
-supports max_rows early termination
-```
-
-Do not force global sorting into streaming mode unless implementing an explicit external-sort system.
+Never merge these meanings.
 
 ---
 
-## 4.4 `--limit` vs `--max-rows`
+# 6. PHASE A SPECIFICATION — Core Correctness
 
-These semantics must remain distinct.
-
-```text
---limit
-    output/display limit only
-
---max-rows
-    hard execution limit
-    stops reading additional rows/files once satisfied
-```
-
-Example:
+Status expected at current handoff:
 
 ```text
---stream --limit 5
+A1 DONE
+A2 DONE
+A3 DONE
+396 passed
 ```
 
-may scan all matching data but print only 5 rows.
+## A1. UPSERT physical-state regression
 
-Example:
+Generic `register_data_file()` conflict update must NOT overwrite:
 
 ```text
---stream --max-rows 1000 --limit 20
+storage_status
+remote_path
+lifecycle_status
 ```
 
-must stop execution after at most 1000 yielded rows and print at most 20.
-
----
-
-# 5. Multi-Instrument / Multi-Bucket Status
-
-Current multi-instrument production validation:
-
-```text
-3 instruments
-113 rows
-```
-
-Verified instruments:
-
-```text
-XKRX:000660
-XKRX:005930
-XKRX:042700
-```
-
-The multi-bucket Catalog optimization has now been introduced.
-
-Target SQL behavior:
-
-```sql
-bucket = ANY(%(buckets)s)
-```
-
-instead of:
-
-```text
-bucket 20 -> SQL #1
-bucket 5f -> SQL #2
-bucket f1 -> SQL #3
-```
-
-Desired:
-
-```text
-(20, 5f, f1) -> one SQL call
-```
-
-The dedicated multi-instrument test suite has been updated to reflect new semantics.
-
-Current baseline after update:
-
-```text
-392 passed
-```
-
----
-
-# 6. Immediate Next Task — FIX POSTGRES UPSERT PHYSICAL-STATE REGRESSION
-
-This is the highest-priority remaining correctness issue.
-
-Current `build_insert_data_file_sql()` conflict update still contains behavior equivalent to:
-
-```sql
-storage_status = EXCLUDED.storage_status,
-remote_path = EXCLUDED.remote_path
-```
-
-This is unsafe.
-
-## 6.1 Failure scenario
-
-Existing row:
-
-```text
-storage_status = uploaded
-remote_path = /nas/.../file.parquet
-```
-
-A recovery / retry / duplicate registration reconstructs:
-
-```text
-DataFileRecord(
-    storage_status="local",
-    remote_path=None
-)
-```
-
-Generic UPSERT can regress the Catalog row to:
-
-```text
-storage_status = local
-remote_path = NULL
-```
-
-That is wrong.
-
----
-
-## 6.2 Required design
-
-Generic registration should update file metadata only.
-
-Physical state transitions must be explicit.
-
-Correct conceptual ownership:
+Explicit state transition ownership:
 
 ```text
 register_data_file()
-    metadata registration
+    metadata registration only
 
 mark_uploaded()
     local -> uploaded
     set remote_path
 ```
 
-Conflict UPSERT must preserve existing:
+## A2. Regression tests
 
-```text
-storage_status
-remote_path
-lifecycle_status
+Must cover:
+- uploaded state preserved
+- remote_path preserved
+- lifecycle preserved
+- `mark_uploaded()` still works
+
+## A3. Full validation
+
+Run:
+
+```bash
+pytest -q tests/unit
 ```
 
-unless a dedicated explicit state-transition method changes them.
-
----
-
-## 6.3 Required implementation
-
-Modify `build_insert_data_file_sql()`.
-
-On conflict, update metadata such as:
+Current expected baseline after Phase A:
 
 ```text
-sha256
-row_count
-file_size
-min_event_time
-max_event_time
-schema_version
-updated_at
-```
-
-Do NOT overwrite:
-
-```text
-storage_status
-remote_path
-lifecycle_status
-```
-
-The INSERT path may still accept initial values.
-
----
-
-## 6.4 Required regression tests
-
-Add tests covering at minimum:
-
-### A. SQL safety
-
-Generated conflict-update SQL must not contain:
-
-```text
-storage_status = EXCLUDED.storage_status
-remote_path = EXCLUDED.remote_path
-lifecycle_status = EXCLUDED.lifecycle_status
-```
-
-### B. uploaded state preservation
-
-Conceptually verify:
-
-```text
-existing uploaded row
-+
-duplicate generic registration
-=
-still uploaded
-```
-
-### C. remote_path preservation
-
-Existing remote path must not be erased by a default `None`.
-
-### D. explicit mark_uploaded still works
-
-`mark_uploaded()` remains the official physical-state transition method.
-
-### E. lifecycle remains protected
-
-Superseded/archived must not be reactivated by generic registration.
-
-Acceptance:
-
-```text
-all existing tests pass
-+
-new regression tests pass
+396 passed
 ```
 
 ---
 
-# 7. Next Task — QUERY OBSERVABILITY / STREAMING STATS
+# 7. PHASE B1 SPECIFICATION — Streaming / Query Observability
 
-Current full-query stats:
+> This section is the technical specification for roadmap item **B1**.
+> It is NOT an independent execution-order instruction.
+
+Current full query exposes roughly:
 
 ```text
 catalog_files
@@ -682,18 +424,14 @@ rows_read
 rows_returned
 ```
 
-Streaming CLI currently mainly exposes:
+Streaming currently exposes mainly:
 
 ```text
 total_batches
 rows_returned
 ```
 
-For large-scale use, add observability.
-
----
-
-## 7.1 Desired metrics
+## Required metrics
 
 At minimum:
 
@@ -702,13 +440,13 @@ catalog_sql_calls
 catalog_files
 parquet_files_materialized
 parquet_files_read
-physical_rows_in_candidate_files
+candidate_physical_rows
 rows_yielded
 bytes_materialized
 batches_yielded
 ```
 
-Optional but recommended:
+Recommended timing metrics:
 
 ```text
 query_duration_seconds
@@ -717,80 +455,44 @@ materialization_duration_seconds
 scan_duration_seconds
 ```
 
----
+### Semantic requirement
 
-## 7.2 Important semantics
+`item.row_count` means physical rows in candidate files.
 
-Do not incorrectly label candidate-file physical row counts as exact Arrow-scanned rows.
+Do NOT label it exact Arrow-scanned rows.
 
-If the Catalog provides:
-
-```text
-item.row_count
-```
-
-that represents physical rows in candidate files.
-
-Prefer naming like:
+Prefer:
 
 ```text
 candidate_physical_rows
 ```
 
-rather than implying precise rows actually read from storage.
+### Compatibility requirement
+
+Do not break current `iter_batches()` generator API.
+
+Possible implementation patterns:
+- mutable `StreamingQueryStats`
+- `iter_batches_with_stats()`
+- streaming session object
+
+Choose the simplest backward-compatible design.
+
+### Acceptance criteria B1
+
+- existing query APIs remain compatible
+- streaming remains bounded-memory
+- metrics are well-defined
+- CLI/reporting exposes useful stats
+- focused tests pass
+- full unit suite passes
+- `PROJECT_STATUS.md` updated
 
 ---
 
-## 7.3 Design suggestion
-
-Avoid breaking current `iter_batches()` generator API.
-
-Possible designs:
-
-### Option A
-
-Add a mutable stats collector:
-
-```python
-StreamingQueryStats
-```
-
-and pass it into `iter_batches()`.
-
-### Option B
+# 8. PHASE B2 SPECIFICATION — Large Universe Input
 
 Add:
-
-```python
-iter_batches_with_stats()
-```
-
-that exposes both batches and a final stats object.
-
-### Option C
-
-Add a streaming session object.
-
-Choose the simplest design that:
-
-- preserves existing API compatibility
-- does not accumulate result data in memory
-- gives reliable metrics
-
----
-
-# 8. Next Task — QUERY LARGE UNIVERSE INPUT
-
-Current CLI supports:
-
-```text
---instrument
---instruments ...
-```
-
-Add support for large universes.
-
-Recommended:
 
 ```text
 --instruments-file path/to/universe.txt
@@ -802,62 +504,58 @@ Format:
 XKRX:005930
 XKRX:000660
 XKRX:042700
-...
 ```
 
 Requirements:
-
 - UTF-8
 - blank lines ignored
 - whitespace stripped
 - duplicates removed
-- preserve stable input order
-- merge behavior with `--instrument` / `--instruments` must be explicit
-- reject completely empty effective instrument set when the user supplied a file expecting instruments
+- stable order preserved
+- explicit merge semantics with `--instrument` / `--instruments`
+- empty effective set handled safely
 
-Do not require passing thousands of instruments as shell arguments.
+### Acceptance criteria B2
 
----
-
-# 9. Next Task — UNIVERSAL COMPACTION
-
-Current compaction work was primarily Naver/forum-post specific.
-
-This must become a generic storage subsystem.
+- large instrument list does not require huge shell arg list
+- old CLI flags remain compatible
+- tests cover duplicate/blank/merge behavior
+- full unit suite passes
 
 ---
 
-## 9.1 Goal
+# 9. PHASE B3 SPECIFICATION — Production Query Smoke Tests
 
-Convert many small active Parquet files into fewer larger files while preserving logical records and lifecycle history.
+Perform safe read-only production query validation.
 
-Desired workflow:
+At minimum validate:
+- single instrument
+- 3 instruments
+- larger universe if available
+- timezone date filter
+- streaming
+- `max_rows`
+- JSONL export
+- Parquet export
+- observability metrics
 
-```text
-select active files
-        ↓
-read records
-        ↓
-deduplicate by logical identity/version policy
-        ↓
-write compacted replacement files
-        ↓
-verify replacement
-        ↓
-register new files
-        ↓
-mark new files uploaded/active
-        ↓
-mark old files superseded
-```
+Do not mutate production data.
 
-Never delete originals before replacement verification.
+### Acceptance criteria B3
+
+- output instruments correct
+- no superseded files read
+- no unexpected SQL-per-instrument regression
+- expected bounded streaming behavior
+- status recorded in `PROJECT_STATUS.md`
 
 ---
 
-## 9.2 Generic selection dimensions
+# 10. PHASE C1 SPECIFICATION — Generic Compaction
 
-Compaction should support grouping by:
+Convert site-specific compaction into reusable storage maintenance.
+
+Group dimensions:
 
 ```text
 site_id
@@ -867,116 +565,60 @@ partition_date
 bucket
 ```
 
-Potential policy inputs:
+Workflow:
 
 ```text
-minimum file count
-minimum/maximum target size
-maximum rows per compacted file
-age threshold
+select active files
+→ read
+→ deduplicate according to logical/version policy
+→ write replacement
+→ verify
+→ register
+→ upload/activate replacement
+→ mark old files superseded
 ```
 
----
+Never supersede source files before replacement is durable.
 
-## 9.3 Safety
+Must support dry-run.
 
-Compaction must be idempotent.
-
-Must not:
-
-- reactivate superseded files
-- double-count old + new files
-- mark source files superseded before replacement is durable
-- erase audit history
-
----
-
-## 9.4 Generic CLI / script
-
-Create a generic command, e.g.:
+Suggested CLI:
 
 ```text
 scripts/compact_data.py
 ```
 
-or proper CLI command.
+### Acceptance criteria C1
 
-Support dry-run.
-
-Example conceptual usage:
-
-```text
---site naver_finance
---dataset forum_post
---date 2026-08-26
---bucket 20
---dry-run
-```
+- generic across datasets/sites
+- idempotent
+- dry-run available
+- lifecycle-safe
+- tests + full suite pass
 
 ---
 
-# 10. Next Task — STORAGE AUDIT / REPAIR
+# 11. PHASE C2 SPECIFICATION — Generic Storage Audit
 
-For billions of records, maintenance tools are mandatory.
-
-Create a general audit system.
-
----
-
-## 10.1 Detect
-
-At minimum:
-
-### Catalog problems
+Detect:
 
 ```text
 active + uploaded + missing remote_path
-active + uploaded + remote file missing
-file_size mismatch
+remote file missing
+size mismatch
 checksum mismatch
-duplicate conflicting file metadata
+orphan remote files
+stale local files
+lifecycle inconsistencies
 ```
 
-### Storage problems
-
-```text
-remote file exists but no Catalog row
-orphan sidecars/manifests
-stale local spool files
-```
-
-### Lifecycle problems
-
-```text
-superseded file incorrectly considered active
-replacement missing while sources superseded
-archived file accidentally queried
-```
-
----
-
-## 10.2 Audit modes
-
-Implement:
-
-```text
-dry-run / report
-repair-safe
-```
-
-Dangerous destructive actions should never be automatic without explicit option.
-
----
-
-## 10.3 Output
-
-Prefer structured output:
+Structured output preferred:
 
 ```text
 JSON / JSONL
 ```
 
-with summary:
+Summary metrics:
 
 ```text
 files_checked
@@ -985,46 +627,73 @@ missing_remote
 size_mismatch
 checksum_mismatch
 orphans
-repairs_applied
 ```
+
+### Acceptance criteria C2
+
+- read-only audit mode safe
+- useful machine-readable report
+- tests cover major inconsistency classes
 
 ---
 
-# 11. Next Task — UNIVERSAL RETENTION / CLEANUP POLICY
+# 12. PHASE C3 SPECIFICATION — Safe Repair
 
-Local disk is small.
+Repair must be explicitly invoked.
 
-The framework already has cleanup concepts, but production-scale policy should be explicit.
-
-Required rules:
+Modes:
 
 ```text
-never delete local file before:
-    upload success
-    verification success
-    Catalog success
-    SeenStore commit
-    checkpoint commit
+dry-run
+repair-safe
 ```
 
-Potential retention controls:
+Do not auto-delete.
+
+Repair should handle only deterministic safe cases unless explicitly authorized.
+
+### Acceptance criteria C3
+
+- dry-run clearly shows intended changes
+- repair is idempotent where possible
+- destructive actions separated from safe repair
+- tests + full suite pass
+
+---
+
+# 13. PHASE C4 SPECIFICATION — Retention / Cleanup
+
+Never delete local files before:
+
+```text
+upload success
+verification success
+Catalog success
+SeenStore commit
+checkpoint commit
+```
+
+Potential policies:
 
 ```text
 keep local failures
-keep manifests for N days
-keep superseded remote files for rollback period
-archive before permanent deletion
+manifest retention
+superseded rollback window
+archive before permanent delete
 ```
 
-Do not add aggressive deletion until audit and recovery tools are reliable.
+### Acceptance criteria C4
+
+- deletion policy explicit
+- no premature cleanup
+- dry-run for risky cleanup
+- tests cover barrier safety
 
 ---
 
-# 12. Next Task — RECOVERY HARDENING
+# 14. PHASE D1 SPECIFICATION — Fault Injection
 
-Recovery should be able to resume after failure at any durable boundary.
-
-Test failure after:
+Inject failures after:
 
 ```text
 Parquet write
@@ -1035,102 +704,102 @@ SeenStore commit
 checkpoint
 ```
 
-Expected behavior:
-
-- no logical data loss
-- no duplicate logical active records
-- no premature checkpoint advance
-- re-run is safe
-- explicit state transitions remain monotonic
-
-Add fault-injection tests if practical.
+Validate:
+- no data loss
+- no premature checkpoint
+- retry safe
+- no duplicate logical active data
 
 ---
 
-# 13. Next Task — PERFORMANCE / SCALE VALIDATION
+# 15. PHASE D2 SPECIFICATION — Recovery Idempotency
 
-Before full-market crawling, test with synthetic and/or production-like large data.
+Repeated recovery must converge to a correct durable state.
+
+Validate:
+- state transitions monotonic
+- no reactivation of superseded/archived
+- uploaded does not regress to local
+- retry does not duplicate logical active data
 
 ---
 
-## 13.1 Query scale tests
+# 16. PHASE D3 SPECIFICATION — Crash Boundary Validation
 
-Test:
+Test crash/restart behavior across all durable boundaries.
 
-```text
-100 instruments
-1000 instruments
-large date ranges
-large multi-bucket sets
-```
+Acceptance:
+- recovery produces same logical end state as uninterrupted run
+
+---
+
+# 17. PHASE E1 SPECIFICATION — 100/1000 Instrument Query Scale
 
 Measure:
+- Catalog SQL calls
+- candidate files
+- buckets
+- rows
+- time
+
+Important invariant:
 
 ```text
-Catalog SQL count
-candidate files
-remote bytes
-memory
-execution time
+SQL count must not scale one-per-instrument
 ```
 
 ---
 
-## 13.2 Streaming memory test
+# 18. PHASE E2 SPECIFICATION — Memory Testing
 
-Verify memory does not grow linearly with result size.
+Verify bounded memory for:
+- `iter_batches()`
+- JSONL export
+- Parquet export
 
-Especially test:
+Never accumulate full large result via full-table `to_pylist()`.
 
-```text
-iter_batches()
-JSONL export
-Parquet export
-```
-
-Never call:
-
-```python
-to_pylist()
-```
-
-on entire large query results.
-
-Per-batch conversion is acceptable when needed.
+Per-batch conversion is acceptable.
 
 ---
 
-## 13.3 File-size strategy
+# 19. PHASE E3 SPECIFICATION — File Size / Compaction Tuning
 
-Determine practical target Parquet file sizes.
+Benchmark practical target Parquet sizes.
 
 Avoid:
+- huge tiny-file counts
+- giant files that make narrow SCP queries expensive
 
-```text
-millions of tiny files
-```
-
-Also avoid giant files that are expensive to fetch over SCP for narrow queries.
-
-Benchmark before hard-coding policy.
+Do not hard-code tuning without measurements.
 
 ---
 
-# 14. Next Task — SECOND SITE INTEGRATION
+# 20. PHASE E4 SPECIFICATION — Longer Production Runs
 
-This is the final architectural proof.
+Progress gradually.
 
-Choose a structurally different source from Naver.
+Measure:
+- crawl errors
+- retries
+- duplicate rate
+- records/sec
+- files/day
+- storage growth
+- Catalog growth
+- NAS traffic
+- checkpoint/recovery behavior
+
+---
+
+# 21. PHASE F SPECIFICATION — Second-Site Architecture Proof
 
 Recommended candidates:
-
 - TossInvest
 - HotCopper
 - Stockhouse
 
-The goal is NOT merely “crawl another site”.
-
-The goal is to prove:
+Goal:
 
 ```text
 core/
@@ -1141,100 +810,51 @@ checkpoint/
 Catalog/
 ```
 
-require little or no change.
+should require little or no redesign.
 
-Ideally only:
+Implement primarily:
 
 ```text
 sites/<new_site>/
 ```
 
-plus registry/config additions.
+plus registry/config.
+
+Acceptance:
+- discover
+- crawl
+- normalize
+- checkpoint
+- dedup
+- Parquet
+- Catalog
+- query
+- production smoke
 
 ---
 
-## 14.1 Required second-site proof
+# 22. PHASE G SPECIFICATION — Rollout
 
-Implement at least:
-
-```text
-discover()
-crawl()
-normalize()
-checkpoint progression
-dedup
-Parquet storage
-Catalog
-query
-```
-
-Run production smoke test.
-
----
-
-# 15. Next Task — FULL MARKET / LONG-RUN VALIDATION
-
-After the framework core is stable:
-
-Run controlled full-market crawling.
-
-Suggested progression:
+Progress:
 
 ```text
-3 instruments
-→ 50 instruments
+50 instruments
 → 500 instruments
 → full market
 ```
 
-Observe:
+Monitor and tune before each expansion.
 
-```text
-crawler error rate
-retry rate
-duplicate rate
-records/sec
-files/day
-storage growth
-PostgreSQL growth
-NAS bandwidth
-checkpoint behavior
-recovery behavior
-```
-
-Do not jump directly to uncontrolled full-market crawling.
+Do not jump directly to full-market crawling.
 
 ---
 
-# 16. PostgreSQL Catalog Design Rules
+# 23. PostgreSQL / Catalog Rules
 
-Current important table:
+Important table:
 
 ```text
 marketdata.data_files
-```
-
-Core fields:
-
-```text
-id
-site_id
-country
-dataset
-partition_date
-bucket
-file_path
-sha256
-row_count
-file_size
-min_event_time
-max_event_time
-schema_version
-storage_status
-lifecycle_status
-remote_path
-created_at
-updated_at
 ```
 
 Normal query filter:
@@ -1244,21 +864,7 @@ storage_status = 'uploaded'
 AND lifecycle_status = 'active'
 ```
 
-Useful lookup ordering:
-
-```text
-partition_date
-bucket
-id
-```
-
-Current index includes the important lookup dimensions.
-
----
-
-# 17. Multi-Bucket Catalog API
-
-The current intended APIs include:
+Intended APIs include:
 
 ```python
 list_active_data_files(...)
@@ -1268,29 +874,19 @@ list_active_data_files_range_multi_bucket(...)
 get_data_file(...)
 ```
 
-Behavior:
-
-### Single bucket
-
-Use old APIs for compatibility.
-
-### Multiple buckets
-
-Use one SQL query.
-
-PostgreSQL condition:
+Multiple buckets should use one SQL such as:
 
 ```sql
 bucket = ANY(%(buckets)s)
 ```
 
-Do not regress back to one SQL per instrument.
+Do not regress to one SQL per instrument.
 
 ---
 
-# 18. Parquet Schema
+# 24. Canonical Parquet Schema
 
-Current canonical Parquet schema is effectively:
+Current canonical schema:
 
 ```text
 schema_version: int32 not null
@@ -1316,15 +912,13 @@ payload_json: large_string not null
 relations_json: large_string not null
 ```
 
-Do not casually change this schema.
-
-Schema evolution should be explicit and versioned.
+Schema evolution must be explicit/versioned.
 
 ---
 
-# 19. Partitioning Rules
+# 25. Partitioning Rules
 
-Current layout:
+Layout:
 
 ```text
 site=.../
@@ -1337,13 +931,7 @@ bucket=xx/
 part-....parquet
 ```
 
-Remote storage is under the configured stock data lake path.
-
-Partition datetime is based on DatasetSpec partition-time semantics.
-
-Naive times are normalized to UTC.
-
-Bucket key priority during write:
+Bucket key write priority:
 
 ```text
 instrument_id
@@ -1351,251 +939,47 @@ or scope_id
 or source_id
 ```
 
-Important implication:
-
-Query-side bucket pruning is safe only when `instrument_id` is explicitly known.
-
-Do not derive bucket from `record_uid`.
+Query-side bucket pruning is safe only when instrument ID is explicitly known.
 
 ---
 
-# 20. Naver-Specific Important Semantics
+# 26. Codex Development Rules
 
-Forum post identity must remain stable.
+Before modifying:
+1. inspect actual source
+2. inspect signatures
+3. inspect tests
 
-Dynamic values such as:
+Do not guess APIs.
 
-```text
-view count
-recommend
-dislike
-page number
-crawl time
-```
+For each roadmap item:
+1. inspect
+2. implement smallest compatible change
+3. add/update regression tests
+4. run focused tests
+5. run `pytest -q tests/unit`
+6. update `PROJECT_STATUS.md`
+7. continue to next incomplete roadmap item
 
-must not destabilize logical identity/version unless intentionally modeled.
-
-Current forum-post payload should remain minimal/stable.
-
-Canonical URL should not include irrelevant pagination identity.
-
----
-
-# 21. Coding Rules for Codex
-
-## 21.1 Inspect before modifying
-
-Before changing a method:
-
-```text
-open actual file
-inspect actual signature
-inspect tests
-```
-
-Never guess APIs.
+Do not:
+- redesign working architecture casually
+- alter hash semantics silently
+- alter timezone semantics silently
+- bypass active/uploaded filters
+- advance checkpoint/SeenStore early
+- make streaming accumulate entire result set
+- perform destructive production actions without explicit authorization
 
 ---
 
-## 21.2 Prefer complete replacements for focused changes
+# 27. Framework Core Complete Definition
 
-When modifying a large file:
-
-- replace a full method
-- replace a full class
-- avoid scattering tiny patches unless necessary
-
----
-
-## 21.3 Preserve backward compatibility
-
-Especially:
-
-```text
-single-instrument QuerySpec
-query()
-iter_batches()
-existing CLI flags
-existing Catalog APIs
-```
-
----
-
-## 21.4 Every architectural change requires tests
-
-For each change:
-
-```text
-unit test
-then full unit suite
-then production smoke test when safe
-```
-
----
-
-## 21.5 No destructive production operations without dry-run
-
-For:
-
-```text
-compaction
-retirement
-cleanup
-repair
-migration
-```
-
-support dry-run first.
-
----
-
-## 21.6 Never silently change data semantics
-
-Examples:
-
-- local date vs UTC date
-- lifecycle state
-- hash composition
-- partition key
-- mutation policy
-- source identity
-
-If changing semantics, create migration plan and regression tests.
-
----
-
-# 22. Recommended Work Order
-
-Codex should execute the remaining work in this exact order unless a blocking dependency requires adjustment.
-
-```text
-PHASE A — finish core correctness
-  A1. Fix UPSERT physical-state regression
-  A2. Add regression tests
-  A3. run full tests
-
-PHASE B — query operational maturity
-  B1. streaming/query observability
-  B2. large universe input
-  B3. production query smoke tests
-
-PHASE C — storage maintenance
-  C1. generic compaction
-  C2. generic storage audit
-  C3. safe repair workflows
-  C4. retention/cleanup policy
-
-PHASE D — recovery robustness
-  D1. fault-injection tests
-  D2. recovery idempotency
-  D3. crash-boundary validation
-
-PHASE E — scale validation
-  E1. 100/1000 instrument query tests
-  E2. memory testing
-  E3. file-size / compaction tuning
-  E4. longer production runs
-
-PHASE F — architecture proof
-  F1. second site integration
-  F2. verify core remains unchanged
-  F3. production smoke test
-
-PHASE G — rollout
-  G1. 50 instruments
-  G2. 500 instruments
-  G3. full market
-  G4. monitor and tune
-```
-
----
-
-# 23. Acceptance Criteria by Phase
-
-## Phase A complete when
-
-```text
-generic duplicate register cannot regress uploaded -> local
-remote_path cannot be erased by generic UPSERT
-lifecycle cannot be reactivated by generic UPSERT
-explicit mark_uploaded still works
-all unit tests pass
-```
-
----
-
-## Phase B complete when
-
-```text
-streaming exposes useful metrics
-large instrument universe can be supplied from file
-multi-bucket stays one Catalog SQL
-large result export remains memory bounded
-```
-
----
-
-## Phase C complete when
-
-```text
-compaction is generic
-audit detects Catalog/storage drift
-repair is dry-run safe
-cleanup cannot delete data before durable barrier
-```
-
----
-
-## Phase D complete when
-
-```text
-crash/retry at each major boundary is idempotent
-checkpoint never advances prematurely
-SeenStore never commits prematurely
-active logical data remains consistent
-```
-
----
-
-## Phase E complete when
-
-```text
-1000-instrument queries remain efficient
-streaming memory remains bounded
-Catalog SQL count scales by query, not by instrument
-Parquet file strategy is measured, not guessed
-```
-
----
-
-## Phase F complete when
-
-```text
-second structurally different site works
-without redesigning core storage/query architecture
-```
-
----
-
-## Phase G complete when
-
-```text
-full-market long-running crawl is operational
-recovery is proven
-storage growth is manageable
-query remains usable
-```
-
----
-
-# 24. Definition of “Framework Core Complete”
-
-The core framework can be considered complete when all of these are true:
+Core is complete when:
 
 ```text
 Canonical model stable
-SeenStore durable semantics stable
-Checkpoint durable barrier stable
+SeenStore semantics stable
+checkpoint durable barrier stable
 Parquet storage stable
 Catalog lifecycle stable
 UPSERT monotonic state safe
@@ -1603,99 +987,57 @@ single + multi instrument query stable
 timezone semantics stable
 bucket pruning stable
 streaming stable
-hard max_rows stable
+max_rows stable
+query observability available
+large universe input available
 generic compaction available
 audit/repair available
+retention safe
 recovery fault-tested
+scale behavior validated
 ```
 
-At that point, adding new websites should mainly be a plugin implementation task rather than framework redesign.
+Second-site proof then demonstrates generality.
 
 ---
 
-# 25. Current Estimated Progress
-
-Current state:
+# 28. Current Estimated Progress
 
 ```text
-Core framework: approximately 85% complete
-Query Layer: approximately 95% complete
-Storage maintenance/operations: incomplete
+Core framework: ~85–90%
+Query layer: ~95%
+Storage maintenance: incomplete
+Recovery hardening: incomplete
+Scale validation: incomplete
 Second-site proof: incomplete
-Full-market long-run validation: incomplete
-```
-
-The remaining work is less about inventing architecture and more about:
-
-```text
-correctness hardening
-observability
-maintenance tooling
-recovery testing
-scale testing
-second-site proof
+Full-market rollout: incomplete
 ```
 
 ---
 
-# 26. First Command Codex Should Run
+# 29. Startup Prompt for Codex
 
-Before changing anything:
-
-```bash
-pytest -q tests/unit
-```
-
-Expected current baseline:
+Use this behavior every new Codex session:
 
 ```text
-392 passed
+Read:
+1. Crawl_Framework_V2_Codex_Master_Plan.md
+2. PROJECT_STATUS.md
+
+Then:
+- inspect git status
+- run pytest -q tests/unit
+- reconcile actual repository state with PROJECT_STATUS.md
+- locate the first incomplete item in Section 3 of the Master Plan
+- continue automatically from there
+
+Section 3 is the only authoritative execution order.
+Later sections are technical specifications only.
+
+Do not wait for user confirmation between ordinary roadmap tasks.
+Update PROJECT_STATUS.md after each completed item.
+
+Stop only for destructive production operations, irreversible migrations,
+real NAS data deletion/overwrite, major unresolved architecture conflicts,
+or unavailable required credentials/infrastructure.
 ```
-
-Then inspect:
-
-```text
-src/crawl_framework/storage/postgres.py
-tests/unit/test_postgres.py
-```
-
-and begin **Phase A1: UPSERT physical-state regression fix**.
-
----
-
-# 27. Final Instruction to Codex
-
-Work incrementally and preserve the proven system.
-
-For every task:
-
-```text
-1. inspect current implementation
-2. inspect tests
-3. make the smallest architecture-consistent change
-4. add regression tests
-5. run focused tests
-6. run full unit suite
-7. run a safe production smoke test when relevant
-8. document changed semantics
-```
-
-Never trade correctness for convenience.
-
-Never bypass:
-
-```text
-uploaded + active
-```
-
-Catalog semantics.
-
-Never advance SeenStore/checkpoint before durable storage.
-
-Never make large-query code accumulate entire result sets in memory.
-
-Never reintroduce one SQL call per instrument when multi-bucket batch lookup exists.
-
-The goal is not merely to “make tests pass”.
-
-The goal is a reusable, recoverable, auditable, scalable financial data collection and query platform.

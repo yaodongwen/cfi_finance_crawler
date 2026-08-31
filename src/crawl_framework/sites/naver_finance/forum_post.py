@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import re
+import time
 
 from dataclasses import dataclass
 from typing import (
@@ -77,6 +78,14 @@ class NaverForumHTTPError(
 ):
     """
     HTTP request failed.
+    """
+
+
+class NaverForumPostMissingError(
+    NaverForumHTTPError
+):
+    """
+    A board list item pointed to a discussion detail that no longer exists.
     """
 
 
@@ -854,12 +863,26 @@ class NaverForumClient:
         session: requests.Session | None = None,
         timeout: float = 15.0,
         verify_ssl: bool = True,
+        request_retries: int = 3,
+        retry_sleep_seconds: float = 1.0,
     ) -> None:
 
         if timeout <= 0:
 
             raise ValueError(
                 "timeout must be positive"
+            )
+
+        if request_retries < 1:
+
+            raise ValueError(
+                "request_retries must be >= 1"
+            )
+
+        if retry_sleep_seconds < 0:
+
+            raise ValueError(
+                "retry_sleep_seconds must be >= 0"
             )
 
         self.session = (
@@ -872,6 +895,10 @@ class NaverForumClient:
         self.verify_ssl = (
             verify_ssl
         )
+
+        self.request_retries = request_retries
+
+        self.retry_sleep_seconds = retry_sleep_seconds
 
         self.session.headers.update(
             DEFAULT_HEADERS
@@ -944,14 +971,8 @@ class NaverForumClient:
         )
 
         response = (
-            self.session.get(
-                url,
-                timeout=(
-                    self.timeout
-                ),
-                verify=(
-                    self.verify_ssl
-                ),
+            self._get_with_retries(
+                url
             )
         )
 
@@ -999,16 +1020,24 @@ class NaverForumClient:
         )
 
         response = (
-            self.session.get(
-                url,
-                timeout=(
-                    self.timeout
-                ),
-                verify=(
-                    self.verify_ssl
-                ),
+            self._get_with_retries(
+                url
             )
         )
+
+        status_code = getattr(
+            response,
+            "status_code",
+            None,
+        )
+
+        if status_code == 404:
+
+            raise NaverForumPostMissingError(
+                "Naver discussion detail "
+                "is no longer available: "
+                f"nid={nid}, url={url}"
+            )
 
         self._raise_for_status(
             response,
@@ -1045,6 +1074,51 @@ class NaverForumClient:
         )
 
 
+    def _get_with_retries(
+        self,
+        url: str,
+    ):
+
+        last_error: Exception | None = None
+
+        for attempt in range(
+            1,
+            self.request_retries
+            +
+            1,
+        ):
+
+            try:
+
+                return self.session.get(
+                    url,
+                    timeout=(
+                        self.timeout
+                    ),
+                    verify=(
+                        self.verify_ssl
+                    ),
+                )
+
+            except requests.RequestException as exc:
+
+                last_error = exc
+
+                if attempt >= self.request_retries:
+
+                    break
+
+                if self.retry_sleep_seconds:
+
+                    time.sleep(
+                        self.retry_sleep_seconds
+                    )
+
+        assert last_error is not None
+
+        raise last_error
+
+
     def fetch_post(
         self,
         item: ForumListItem,
@@ -1059,11 +1133,17 @@ class NaverForumClient:
 
         if fetch_detail:
 
-            detail = (
-                self.fetch_detail(
-                    item.nid
+            try:
+
+                detail = (
+                    self.fetch_detail(
+                        item.nid
+                    )
                 )
-            )
+
+            except NaverForumPostMissingError:
+
+                return {}
 
         return merge_forum_raw(
             item,
@@ -1226,6 +1306,10 @@ class NaverForumClient:
                         ),
                     )
                 )
+
+                if not raw:
+
+                    continue
 
                 # =============================================
                 # Ensure source instrument code

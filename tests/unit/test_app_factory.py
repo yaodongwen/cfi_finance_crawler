@@ -14,6 +14,7 @@ from crawl_framework.app_factory import (
     UnknownSiteError,
     make_crawl_context,
     make_config_uploader_factory,
+    _use_concurrent_production_runtime,
 )
 
 from crawl_framework.cli.main import (
@@ -22,6 +23,14 @@ from crawl_framework.cli.main import (
 
 from crawl_framework.core.models import (
     CanonicalRecord,
+)
+
+from crawl_framework.core.concurrency import (
+    StageConcurrencyConfig,
+)
+
+from crawl_framework.core.concurrent_runtime import (
+    ConcurrentProductionRuntime,
 )
 
 from crawl_framework.core.plugin import (
@@ -490,6 +499,82 @@ def test_build_bootstrap(
     )
 
 
+def test_app_factory_wires_concurrent_runtime_when_workers_configured(
+    tmp_path,
+):
+
+    registry = (
+        SiteFactoryRegistry()
+    )
+
+    registry.register(
+        "demo",
+        DemoPlugin,
+    )
+
+    factory = AppFactory(
+        config=AppConfig(
+            paths=(
+                AppPaths.from_root(
+                    tmp_path
+                )
+            ),
+            buffer_min_rows=1,
+            buffer_max_rows=10,
+            stage_concurrency=(
+                StageConcurrencyConfig(
+                    crawl_workers=2,
+                    writer_workers=1,
+                    upload_workers=2,
+                    catalog_workers=2,
+                )
+            ),
+        ),
+        site_registry=registry,
+        connection_factory=(
+            FakeConnection
+        ),
+    )
+
+    bootstrap = factory.build(
+        options()
+    )
+
+    assert isinstance(
+        bootstrap.runtime,
+        ConcurrentProductionRuntime,
+    )
+
+    assert (
+        bootstrap.runtime.crawl_workers
+        == 2
+    )
+
+    assert (
+        bootstrap.runtime.upload_workers
+        == 2
+    )
+
+
+def test_runtime_selector_keeps_legacy_single_worker_path():
+
+    assert (
+        _use_concurrent_production_runtime(
+            StageConcurrencyConfig()
+        )
+        is False
+    )
+
+    assert (
+        _use_concurrent_production_runtime(
+            StageConcurrencyConfig(
+                upload_workers=2
+            )
+        )
+        is True
+    )
+
+
 @pytest.mark.asyncio
 async def test_built_app_runs(
     tmp_path,
@@ -733,6 +818,114 @@ sync:
     assert isinstance(
         uploader,
         RsyncUploader,
+    )
+
+
+def test_load_config_parses_runtime_and_queue_knobs(
+    tmp_path,
+):
+
+    from crawl_framework.config import (
+        load_config,
+    )
+
+    config_path = (
+        tmp_path
+        / "config.yaml"
+    )
+
+    config_path.write_text(
+        """
+local:
+  output_dir: "./outputs"
+  warehouse_dir: "./warehouse"
+  index_cache_dir: "./index"
+
+server:
+  host: "192.168.1.33"
+  user: "dwyao"
+  data_dir: "/mnt/data/stocklake"
+
+postgres:
+  host: "192.168.1.33"
+  port: 5432
+  database: "stock_data"
+  user: "stock"
+
+storage:
+  local_warehouse: "./warehouse"
+  server_warehouse: "/mnt/data/stocklake"
+  target_file_size_mb: 128
+  max_rows_per_file: 200000
+  max_buffer_age_seconds: 60
+
+runtime:
+  crawl_workers: 32
+  attachment_workers: 8
+  writer_workers: 2
+  upload_workers: 4
+  catalog_workers: 3
+
+http:
+  concurrency: 64
+
+queues:
+  records: 5000
+  durable_files: 256
+  uploads: 128
+  catalog: 64
+  attachments: 512
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        config_path
+    )
+
+    assert (
+        config.runtime.crawl_workers
+        == 32
+    )
+
+    assert (
+        config.storage.target_file_size_mb
+        == 128
+    )
+
+    assert (
+        config.storage.max_rows
+        == 200000
+    )
+
+    assert (
+        config.storage.max_buffer_age_seconds
+        == 60
+    )
+
+    assert (
+        config.runtime.http_concurrency
+        == 64
+    )
+
+    assert (
+        config.runtime.attachment_workers
+        == 8
+    )
+
+    assert (
+        config.runtime.catalog_workers
+        == 3
+    )
+
+    assert (
+        config.queues.records
+        == 5000
+    )
+
+    assert (
+        config.queues.attachments
+        == 512
     )
 
 def test_make_crawl_context_passes_max_pages():
