@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 
@@ -68,6 +69,11 @@ DEFAULT_COLUMNS: tuple[str, ...] = (
     "payload_json",
     "relations_json",
 )
+
+RELATION_AWARE_DATASETS = {
+    "news_article",
+    "research_report",
+}
 
 
 # ============================================================
@@ -933,6 +939,14 @@ def list_candidate_files(
         )
     )
 
+    query_buckets = (
+        ()
+        if uses_relation_filter(
+            query
+        )
+        else query.buckets
+    )
+
     # ========================================================
     # 有完整日期范围
     # ========================================================
@@ -960,7 +974,7 @@ def list_candidate_files(
         # 查询该日期范围全部 bucket。
         # ----------------------------------------------------
 
-        if not query.buckets:
+        if not query_buckets:
 
             return (
                 catalog.list_active_data_files_range(
@@ -985,7 +999,7 @@ def list_candidate_files(
         # ----------------------------------------------------
 
         if len(
-            query.buckets
+            query_buckets
         ) == 1:
 
             return (
@@ -1000,7 +1014,7 @@ def list_candidate_files(
                         end_partition_date
                     ),
                     bucket=(
-                        query.buckets[0]
+                        query_buckets[0]
                     ),
                 )
             )
@@ -1026,7 +1040,7 @@ def list_candidate_files(
                     end_partition_date
                 ),
                 buckets=(
-                    query.buckets
+                    query_buckets
                 ),
             )
         )
@@ -1041,7 +1055,7 @@ def list_candidate_files(
     # 查询所有 active uploaded 文件。
     # --------------------------------------------------------
 
-    if not query.buckets:
+    if not query_buckets:
 
         return (
             catalog.list_active_data_files(
@@ -1057,7 +1071,7 @@ def list_candidate_files(
     # --------------------------------------------------------
 
     if len(
-        query.buckets
+        query_buckets
     ) == 1:
 
         return (
@@ -1066,7 +1080,7 @@ def list_candidate_files(
                 dataset=query.dataset,
                 country=query.country,
                 bucket=(
-                    query.buckets[0]
+                    query_buckets[0]
                 ),
             )
         )
@@ -1082,10 +1096,10 @@ def list_candidate_files(
             dataset=query.dataset,
             country=query.country,
             buckets=(
-                query.buckets
-            ),
+                    query_buckets
+                ),
+            )
         )
-    )
 
     
 # ============================================================
@@ -1131,7 +1145,12 @@ def build_dataset_filter(
                 condition
             )
 
-    if query.instrument_ids:
+    if (
+        query.instrument_ids
+        and not uses_relation_filter(
+            query
+        )
+    ):
 
         if len(
             query.instrument_ids
@@ -1223,7 +1242,12 @@ def build_parquet_filters(
         ]
     ] = []
 
-    if query.instrument_ids:
+    if (
+        query.instrument_ids
+        and not uses_relation_filter(
+            query
+        )
+    ):
 
         if len(
             query.instrument_ids
@@ -1289,6 +1313,169 @@ def build_parquet_filters(
     return [
         filters
     ]
+
+
+def uses_relation_filter(
+    query: NormalizedQuery,
+) -> bool:
+
+    return (
+        bool(
+            query.instrument_ids
+        )
+        and query.dataset
+        in RELATION_AWARE_DATASETS
+    )
+
+
+def row_matches_instrument_relation(
+    row: dict,
+    instrument_ids: set[
+        str
+    ],
+) -> bool:
+
+    instrument_id = row.get(
+        "instrument_id"
+    )
+
+    if (
+        instrument_id is not None
+        and str(
+            instrument_id
+        )
+        in instrument_ids
+    ):
+
+        return True
+
+    relations_json = row.get(
+        "relations_json"
+    )
+
+    if not relations_json:
+
+        return False
+
+    try:
+
+        relations = json.loads(
+            relations_json
+        )
+
+    except (
+        TypeError,
+        json.JSONDecodeError,
+    ):
+
+        return False
+
+    if not isinstance(
+        relations,
+        list,
+    ):
+
+        return False
+
+    for relation in relations:
+
+        if not isinstance(
+            relation,
+            dict,
+        ):
+
+            continue
+
+        relation_instrument_id = relation.get(
+            "instrument_id"
+        )
+
+        if (
+            relation_instrument_id is not None
+            and str(
+                relation_instrument_id
+            )
+            in instrument_ids
+        ):
+
+            return True
+
+    return False
+
+
+def apply_relation_filter_to_table(
+    table: pa.Table,
+    query: NormalizedQuery,
+) -> pa.Table:
+
+    if (
+        table.num_rows < 1
+        or not uses_relation_filter(
+            query
+        )
+    ):
+
+        return table
+
+    instrument_ids = set(
+        query.instrument_ids
+    )
+
+    rows = [
+        row
+        for row in table.to_pylist()
+        if row_matches_instrument_relation(
+            row,
+            instrument_ids,
+        )
+    ]
+
+    if not rows:
+
+        return table.slice(
+            0,
+            0,
+        )
+
+    return pa.Table.from_pylist(
+        rows,
+        schema=table.schema,
+    )
+
+
+def apply_relation_filter_to_batch(
+    batch: pa.RecordBatch,
+    query: NormalizedQuery,
+) -> pa.RecordBatch:
+
+    if (
+        batch.num_rows < 1
+        or not uses_relation_filter(
+            query
+        )
+    ):
+
+        return batch
+
+    table = apply_relation_filter_to_table(
+        pa.Table.from_batches(
+            [
+                batch
+            ]
+        ),
+        query,
+    )
+
+    batches = table.to_batches()
+
+    if not batches:
+
+        return batch.slice(
+            0,
+            0,
+        )
+
+    return batches[0]
 
 
 # ============================================================
@@ -1580,6 +1767,11 @@ class CatalogParquetReader:
                         query.columns
                     ),
                     filters=filters,
+                )
+
+                table = apply_relation_filter_to_table(
+                    table,
+                    query,
                 )
 
                 if table.num_rows < 1:
@@ -1900,6 +2092,11 @@ class CatalogParquetReader:
                 for batch in (
                     scanner.to_batches()
                 ):
+
+                    batch = apply_relation_filter_to_batch(
+                        batch,
+                        query,
+                    )
 
                     if batch.num_rows < 1:
 

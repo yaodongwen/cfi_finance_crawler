@@ -718,6 +718,58 @@ class RecoveryStore:
 
         return updated
 
+
+    def reclassify_failed(
+        self,
+        manifest_id: str,
+        *,
+        retryable: bool,
+        retry_reason: str,
+    ) -> RecoveryManifest:
+        """
+        更新 failed manifest 的 retry classification。
+
+        这是非破坏性 repair：不删除 manifest，
+        不改变 failed_from_stage，不增加 retry_count，
+        只允许此前误判的 terminal failure 再次进入
+        startup recovery。
+        """
+
+        current = self.load(
+            manifest_id
+        )
+
+        if current is None:
+
+            raise KeyError(
+                "recovery manifest "
+                f"not found: {manifest_id!r}"
+            )
+
+        if current.stage != "failed":
+
+            raise ValueError(
+                "only failed manifests can be "
+                "reclassified"
+            )
+
+        updated = replace(
+            current,
+            retryable=bool(
+                retryable
+            ),
+            retry_reason=str(
+                retry_reason
+            ),
+            updated_at=utc_now_iso(),
+        )
+
+        self.save(
+            updated
+        )
+
+        return updated
+
 # ============================================================
 # Recovery result
 # ============================================================

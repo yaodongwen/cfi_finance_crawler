@@ -50,6 +50,8 @@ def test_negative_retry_count_rejected():
         "temporary failure",
         "rsync failed",
         "ssh failed",
+        "setlocale: LC_ALL: cannot change locale (C.UTF-8)",
+        "/bin/sh: warning: setlocale: LC_ALL: cannot change locale",
         "database is locked",
         "deadlock detected",
         "too many connections",

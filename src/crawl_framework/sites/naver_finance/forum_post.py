@@ -865,6 +865,7 @@ class NaverForumClient:
         verify_ssl: bool = True,
         request_retries: int = 3,
         retry_sleep_seconds: float = 1.0,
+        rate_limiter=None,
     ) -> None:
 
         if timeout <= 0:
@@ -899,6 +900,8 @@ class NaverForumClient:
         self.request_retries = request_retries
 
         self.retry_sleep_seconds = retry_sleep_seconds
+
+        self.rate_limiter = rate_limiter
 
         self.session.headers.update(
             DEFAULT_HEADERS
@@ -1090,7 +1093,13 @@ class NaverForumClient:
 
             try:
 
-                return self.session.get(
+                if self.rate_limiter is not None:
+
+                    self.rate_limiter.before_request(
+                        url
+                    )
+
+                response = self.session.get(
                     url,
                     timeout=(
                         self.timeout
@@ -1100,7 +1109,55 @@ class NaverForumClient:
                     ),
                 )
 
+                status_code = int(
+                    getattr(
+                        response,
+                        "status_code",
+                        0,
+                    )
+                    or 0
+                )
+
+                if self.rate_limiter is not None:
+
+                    if status_code in {
+                        403,
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                    }:
+
+                        self.rate_limiter.record_failure(
+                            url,
+                            throttled=(
+                                status_code
+                                in {
+                                    403,
+                                    429,
+                                }
+                            ),
+                        )
+
+                    elif (
+                        status_code
+                        and status_code < 400
+                    ):
+
+                        self.rate_limiter.record_success(
+                            url
+                        )
+
+                return response
+
             except requests.RequestException as exc:
+
+                if self.rate_limiter is not None:
+
+                    self.rate_limiter.record_failure(
+                        url
+                    )
 
                 last_error = exc
 

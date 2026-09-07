@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from dataclasses import (
     dataclass,
@@ -22,12 +23,14 @@ from crawl_framework.core.bootstrap import (
 )
 
 from crawl_framework.core.concurrency import (
+    DatasetResourceBudget,
     QueueSizeConfig,
     StageConcurrencyConfig,
 )
 
 from crawl_framework.core.concurrent_runtime import (
     ConcurrentProductionRuntime,
+    ProgressSnapshot,
 )
 
 from crawl_framework.core.plugin import (
@@ -43,6 +46,11 @@ from crawl_framework.storage.buffer import (
     BufferConfig,
     RecordBuffer,
 )
+from crawl_framework.storage.attachment import (
+    AttachmentPipeline,
+    HTTPAttachmentDownloader,
+    LocalAttachmentStore,
+)
 
 from crawl_framework.storage.checkpoint import (
     FileCheckpointStore,
@@ -50,6 +58,10 @@ from crawl_framework.storage.checkpoint import (
 
 from crawl_framework.storage.cleaner import (
     Cleaner,
+)
+
+from crawl_framework.storage.compaction import (
+    compact_active_dataset,
 )
 
 from crawl_framework.storage.parquet_writer import (
@@ -91,6 +103,42 @@ from crawl_framework.storage.uploader import (
     BaseUploader,
     LocalUploader,
 )
+
+
+def format_progress_snapshot(
+    snapshot: ProgressSnapshot,
+) -> str:
+
+    return (
+        "[progress] "
+        f"dataset={snapshot.dataset} "
+        f"scopes={snapshot.scopes_finished}/"
+        f"{snapshot.scopes_discovered} "
+        f"pending={snapshot.pending_scopes} "
+        f"records={snapshot.records_crawled} "
+        f"files={snapshot.files_written} "
+        f"uploads={snapshot.uploads_completed} "
+        f"catalog={snapshot.catalog_jobs_completed} "
+        f"queues=record:{snapshot.record_queue_depth},"
+        f"upload:{snapshot.upload_queue_depth},"
+        f"catalog:{snapshot.catalog_queue_depth} "
+        f"busy=crawl:{snapshot.crawl_busy_time:.2f}s,"
+        f"upload:{snapshot.upload_busy_time:.2f}s,"
+        f"catalog:{snapshot.catalog_busy_time:.2f}s"
+    )
+
+
+def print_progress_snapshot(
+    snapshot: ProgressSnapshot,
+) -> None:
+
+    print(
+        format_progress_snapshot(
+            snapshot
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 def make_crawl_context(
     options: CLIOptions,
@@ -145,7 +193,7 @@ def make_crawl_context(
     }
 
     # ========================================================
-    # Optional max pages override
+    # Optional max pages overrides
     # ========================================================
 
     if (
@@ -157,6 +205,178 @@ def make_crawl_context(
             "forum_max_pages"
         ] = int(
             options.max_pages
+        )
+
+        extra[
+            "news_max_pages"
+        ] = int(
+            options.max_pages
+        )
+
+        extra[
+            "research_max_pages"
+        ] = int(
+            options.max_pages
+        )
+
+    for option_name in (
+        "forum_max_pages",
+        "news_max_pages",
+        "research_max_pages",
+    ):
+
+        value = getattr(
+            options,
+            option_name,
+            None,
+        )
+
+        if value is not None:
+
+            extra[
+                option_name
+            ] = int(
+                value
+            )
+
+    if options.news_mode is not None:
+
+        extra[
+            "news_mode"
+        ] = str(
+            options.news_mode
+        )
+
+    if options.research_mode is not None:
+
+        extra[
+            "research_mode"
+        ] = str(
+            options.research_mode
+        )
+
+    if options.download_research_pdf is not None:
+
+        extra[
+            "download_research_pdf"
+        ] = bool(
+            options.download_research_pdf
+        )
+
+    if options.research_detail_workers is not None:
+
+        extra[
+            "research_detail_workers"
+        ] = int(
+            options.research_detail_workers
+        )
+
+    if options.pdf_workers is not None:
+
+        extra[
+            "pdf_workers"
+        ] = int(
+            options.pdf_workers
+        )
+
+    dataset_budgets = {
+        "forum_post": DatasetResourceBudget(
+            crawl_workers=(
+                options.forum_crawl_workers
+            ),
+            http_concurrency=(
+                options.forum_http_concurrency
+            ),
+        ),
+        "news_article": DatasetResourceBudget(
+            crawl_workers=(
+                options.news_crawl_workers
+            ),
+            http_concurrency=(
+                options.news_http_concurrency
+            ),
+        ),
+        "news_instrument": DatasetResourceBudget(
+            crawl_workers=(
+                options.news_crawl_workers
+            ),
+            http_concurrency=(
+                options.news_http_concurrency
+            ),
+        ),
+        "research_report": DatasetResourceBudget(
+            crawl_workers=(
+                options.research_crawl_workers
+            ),
+            http_concurrency=(
+                options.research_http_concurrency
+            ),
+            detail_workers=(
+                options.research_detail_workers
+            ),
+        ),
+        "research_instrument": DatasetResourceBudget(
+            crawl_workers=(
+                options.research_crawl_workers
+            ),
+            http_concurrency=(
+                options.research_http_concurrency
+            ),
+            detail_workers=(
+                options.research_detail_workers
+            ),
+        ),
+        "attachment": DatasetResourceBudget(
+            crawl_workers=(
+                options.research_crawl_workers
+            ),
+            http_concurrency=(
+                options.research_http_concurrency
+            ),
+            detail_workers=(
+                options.research_detail_workers
+            ),
+            attachment_workers=(
+                options.pdf_workers
+                or options.attachment_workers
+            ),
+        ),
+    }
+
+    dataset_budgets = {
+        dataset: budget
+        for dataset, budget in dataset_budgets.items()
+        if any(
+            value is not None
+            for value in (
+                budget.crawl_workers,
+                budget.http_concurrency,
+                budget.detail_workers,
+                budget.attachment_workers,
+            )
+        )
+    }
+
+    if dataset_budgets:
+
+        extra[
+            "dataset_budgets"
+        ] = dataset_budgets
+
+    if options.research_categories:
+
+        extra[
+            "research_categories"
+        ] = tuple(
+            options.research_categories
+        )
+
+    if options.attachment_limit is not None:
+
+        extra[
+            "attachment_limit"
+        ] = int(
+            options.attachment_limit
         )
 
     return CrawlContext(
@@ -719,6 +939,27 @@ class AppFactory:
                 )
             )
 
+        if hasattr(
+            plugin,
+            "attachment_pipeline",
+        ):
+
+            plugin.attachment_pipeline = (
+                AttachmentPipeline(
+                    downloader=(
+                        HTTPAttachmentDownloader()
+                    ),
+                    store=(
+                        LocalAttachmentStore(
+                            self.config
+                            .paths
+                            .warehouse
+                        )
+                    ),
+                    uploader=uploader,
+                )
+            )
+
         # ====================================================
         # 9. PostgreSQL
         # ====================================================
@@ -882,9 +1123,36 @@ class AppFactory:
             options
         )
 
-        concurrency = (
-            self.config
-            .stage_concurrency
+        base_concurrency = (
+            self.config.stage_concurrency
+        )
+
+        concurrency = StageConcurrencyConfig(
+            crawl_workers=(
+                options.crawl_workers
+                or base_concurrency.crawl_workers
+            ),
+            http_concurrency=(
+                options.http_concurrency
+                or base_concurrency.http_concurrency
+            ),
+            attachment_workers=(
+                options.attachment_workers
+                or options.pdf_workers
+                or base_concurrency.attachment_workers
+            ),
+            writer_workers=(
+                options.writer_workers
+                or base_concurrency.writer_workers
+            ),
+            upload_workers=(
+                options.upload_workers
+                or base_concurrency.upload_workers
+            ),
+            catalog_workers=(
+                options.catalog_workers
+                or base_concurrency.catalog_workers
+            ),
         )
 
         queues = (
@@ -895,6 +1163,36 @@ class AppFactory:
         if _use_concurrent_production_runtime(
             concurrency
         ):
+
+            post_dataset_hook = None
+
+            if options.compact_after_dataset:
+
+                def post_dataset_hook(
+                    dataset: str,
+                ):
+
+                    return compact_active_dataset(
+                        catalog=catalog,
+                        uploader=uploader,
+                        site_id=(
+                            plugin.site_id
+                        ),
+                        country=(
+                            plugin.country
+                        ),
+                        dataset=dataset,
+                        warehouse_root=(
+                            self.config
+                            .paths
+                            .warehouse
+                        ),
+                        min_file_count=(
+                            options.compaction_min_file_count
+                            or 2
+                        ),
+                        dry_run=False,
+                    )
 
             runtime = ConcurrentProductionRuntime(
                 plugin=plugin,
@@ -921,6 +1219,24 @@ class AppFactory:
                 ),
                 catalog_queue_size=(
                     queues.catalog
+                ),
+                progress_reporter=(
+                    print_progress_snapshot
+                    if (
+                        options.progress_interval_seconds
+                        is not None
+                        and not options.json_output
+                    )
+                    else None
+                ),
+                progress_interval_seconds=(
+                    options.progress_interval_seconds
+                ),
+                flush_scope_on_scope_done=(
+                    not options.coalesce_scope_flushes
+                ),
+                post_dataset_hook=(
+                    post_dataset_hook
                 ),
             )
 
@@ -973,6 +1289,7 @@ def _use_concurrent_production_runtime(
         worker_count > 1
         for worker_count in (
             concurrency.crawl_workers,
+            concurrency.attachment_workers,
             concurrency.writer_workers,
             concurrency.upload_workers,
             concurrency.catalog_workers,
@@ -1048,6 +1365,9 @@ def configure_connection_factory(
 
 def make_config_uploader_factory(
     framework_config,
+    *,
+    trust_rsync_success: bool = False,
+    ssh_multiplex: bool | None = None,
 ):
     """
     根据 config.yaml 创建 uploader factory。
@@ -1113,6 +1433,18 @@ def make_config_uploader_factory(
 
         if use_rsync:
 
+            effective_ssh_multiplex = (
+                bool(
+                    ssh_multiplex
+                )
+                if ssh_multiplex is not None
+                else bool(
+                    framework_config
+                    .sync
+                    .ssh_multiplex
+                )
+            )
+
             return RsyncUploader(
                 remote_host=(
                     framework_config
@@ -1135,13 +1467,31 @@ def make_config_uploader_factory(
                     .ssh_port
                 ),
                 dry_run=False,
-                verify_size=True,
+                verify_size=(
+                    not trust_rsync_success
+                ),
 
                 # 第一阶段先关闭远端 SHA256。
                 #
                 # 远端 Linux 虽然通常有 sha256sum，
                 # 但我们先确认真实上传链路稳定。
                 verify_sha256=False,
+                trust_rsync_success=(
+                    trust_rsync_success
+                ),
+                ssh_multiplex=(
+                    effective_ssh_multiplex
+                ),
+                ssh_control_path=(
+                    framework_config
+                    .sync
+                    .ssh_control_path
+                ),
+                ssh_control_persist=(
+                    framework_config
+                    .sync
+                    .ssh_control_persist
+                ),
             )
 
         # ====================================================
@@ -1312,6 +1662,7 @@ def build_default_bootstrap(
                 ),
                 attachment_workers=(
                     options.attachment_workers
+                    or options.pdf_workers
                     or framework_config.runtime.attachment_workers
                 ),
                 writer_workers=(
@@ -1340,7 +1691,13 @@ def build_default_bootstrap(
 
     uploader_factory = (
         make_config_uploader_factory(
-            framework_config
+            framework_config,
+            trust_rsync_success=(
+                options.trust_rsync_success
+            ),
+            ssh_multiplex=(
+                options.ssh_multiplex
+            ),
         )
     )
 

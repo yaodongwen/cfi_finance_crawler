@@ -2,6 +2,7 @@ from datetime import (
     datetime,
     timezone,
 )
+from pathlib import Path
 
 import pytest
 
@@ -74,6 +75,10 @@ def test_datasets():
         == (
             "forum_post",
             "news_article",
+            "news_instrument",
+            "research_report",
+            "research_instrument",
+            "attachment",
         )
     )
 
@@ -97,6 +102,41 @@ def test_validate_datasets():
     assert (
         "news_article"
         in datasets
+    )
+
+    assert (
+        "news_instrument"
+        in datasets
+    )
+
+    assert (
+        "research_report"
+        in datasets
+    )
+
+    assert (
+        "research_instrument"
+        in datasets
+    )
+
+
+def test_default_clients_share_plugin_rate_limiter():
+
+    plugin = NaverFinancePlugin()
+
+    assert (
+        plugin.forum_client.rate_limiter
+        is plugin.rate_limiter
+    )
+
+    assert (
+        plugin.news_client.rate_limiter
+        is plugin.rate_limiter
+    )
+
+    assert (
+        plugin.research_client.rate_limiter
+        is plugin.rate_limiter
     )
 
 
@@ -336,7 +376,42 @@ def test_normalize_news():
 
     assert (
         record.instrument_id
-        == "XKRX:005930"
+        is None
+    )
+
+    assert (
+        record.scope_type
+        == "global"
+    )
+
+    assert (
+        record.scope_id
+        is None
+    )
+
+    assert (
+        record.content
+        == "news body"
+    )
+
+    assert (
+        record.author_name
+        == "reporter"
+    )
+
+    assert (
+        [
+            relation.instrument_id
+            for relation in record.relations
+        ]
+        == [
+            "XKRX:005930"
+        ]
+    )
+
+    assert (
+        record.relations[0].relation_type
+        == "primary"
     )
 
     assert (
@@ -345,6 +420,264 @@ def test_normalize_news():
         ]
         == "001"
     )
+
+
+def test_normalize_news_same_article_has_stable_global_uid_across_scopes():
+
+    plugin = (
+        NaverFinancePlugin()
+    )
+
+    raw = {
+        "article_id": "000123",
+        "office_id": "001",
+        "title": "Shared news",
+        "published_at": (
+            "2026-08-25T01:00:00+00:00"
+        ),
+        "content": "same body",
+        "url": "https://example.com/news",
+    }
+
+    samsung = plugin.normalize(
+        "news_article",
+        raw,
+        CrawlScope(
+            scope_type="instrument",
+            source_key="005930",
+            scope_id="XKRX:005930",
+        ),
+    )
+
+    hynix = plugin.normalize(
+        "news_article",
+        raw,
+        CrawlScope(
+            scope_type="instrument",
+            source_key="000660",
+            scope_id="XKRX:000660",
+        ),
+    )
+
+    assert (
+        samsung.record_uid
+        == hynix.record_uid
+    )
+
+    assert (
+        samsung.version_hash
+        != hynix.version_hash
+    )
+
+    assert (
+        samsung.relations[0].instrument_id
+        == "XKRX:005930"
+    )
+
+    assert (
+        hynix.relations[0].instrument_id
+        == "XKRX:000660"
+    )
+
+
+def test_normalize_news_instrument_materializes_relation():
+
+    plugin = (
+        NaverFinancePlugin()
+    )
+
+    record = plugin.normalize(
+        "news_instrument",
+        {
+            "article_id": "000123",
+            "office_id": "001",
+            "title": "Samsung relation",
+            "canonical_url": (
+                "https://n.news.naver.com/"
+                "mnews/article/001/000123"
+            ),
+        },
+        CrawlScope(
+            scope_type="instrument",
+            source_key="005930",
+            scope_id="XKRX:005930",
+        ),
+    )
+
+    assert record.dataset == "news_instrument"
+
+    assert record.source_id == (
+        "001:000123:XKRX:005930"
+    )
+
+    assert record.instrument_id == "XKRX:005930"
+
+    assert (
+        record.payload[
+            "article_source_id"
+        ]
+        == "001:000123"
+    )
+
+    assert (
+        record.relations[0].relation_type
+        == "primary"
+    )
+
+
+def test_normalize_research_report_in_plugin():
+
+    plugin = NaverFinancePlugin()
+
+    record = plugin.normalize(
+        "research_report",
+        {
+            "report_id": "market-123",
+            "category": "market",
+            "title": "Market outlook",
+            "institution": "NH투자증권",
+            "analyst": "Analyst",
+            "published_at": "2026-08-07",
+            "summary": "research body",
+            "source_url": (
+                "https://finance.naver.com/"
+                "research/market_info_read.naver?nid=123"
+            ),
+            "pdf_url": (
+                "https://finance.naver.com/"
+                "research/123.pdf"
+            ),
+            "instrument_ids": [
+                "XKRX:005930",
+            ],
+        },
+        CrawlScope(
+            scope_type="global",
+            source_key="research",
+        ),
+    )
+
+    assert record.dataset == "research_report"
+
+    assert record.source_id == "market-123"
+
+    assert record.instrument_id == "XKRX:005930"
+
+    assert record.content == "research body"
+
+    assert record.author_name == "Analyst"
+
+    assert record.payload["category"] == "market"
+
+    assert record.payload["pdf_url"] == (
+        "https://finance.naver.com/"
+        "research/123.pdf"
+    )
+
+    assert record.relations[0].instrument_id == (
+        "XKRX:005930"
+    )
+
+
+def test_normalize_research_report_global_without_instrument():
+
+    plugin = NaverFinancePlugin()
+
+    record = plugin.normalize(
+        "research_report",
+        {
+            "report_id": "market-123",
+            "category": "market",
+            "title": "Market outlook",
+            "published_at": "2026-08-07",
+            "summary": "market body",
+        },
+        CrawlScope(
+            scope_type="global",
+            source_key="research",
+        ),
+    )
+
+    assert record.instrument_id is None
+
+    assert record.relations == []
+
+    assert record.record_uid
+
+
+def test_normalize_research_instrument_materializes_relation():
+
+    plugin = NaverFinancePlugin()
+
+    record = plugin.normalize(
+        "research_instrument",
+        {
+            "report_id": "company-123",
+            "category": "company",
+            "instrument_id": "XKRX:005930",
+            "stock_code": "005930",
+            "stock_name": "삼성전자",
+            "title": "Company report",
+            "published_at": "2026-08-07",
+        },
+        CrawlScope(
+            scope_type="global",
+            source_key="research",
+        ),
+    )
+
+    assert record.dataset == "research_instrument"
+
+    assert record.source_id == (
+        "company-123:XKRX:005930"
+    )
+
+    assert record.instrument_id == "XKRX:005930"
+
+    assert record.payload[
+        "report_id"
+    ] == "company-123"
+
+    assert record.relations[0].relation_type == "related"
+
+
+def test_normalize_attachment_metadata():
+
+    plugin = NaverFinancePlugin()
+
+    record = plugin.normalize(
+        "attachment",
+        {
+            "attachment_id": "sha",
+            "parent_record_uid": "parent",
+            "report_id": "market-1",
+            "category": "market",
+            "source_url": "https://example.com/report.pdf",
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+            "sha256": "sha",
+            "file_size": 12,
+            "local_path": "/tmp/report.pdf",
+            "remote_path": "remote/report.pdf",
+            "upload_status": "verified",
+        },
+        CrawlScope(
+            scope_type="global",
+            source_key="research",
+        ),
+    )
+
+    assert record.dataset == "attachment"
+
+    assert record.source_id == "sha"
+
+    assert record.payload[
+        "parent_record_uid"
+    ] == "parent"
+
+    assert record.payload[
+        "upload_status"
+    ] == "verified"
 
 
 # ============================================================
@@ -470,6 +803,86 @@ def test_news_checkpoint():
         == "005930"
     )
 
+
+def test_research_checkpoint():
+
+    plugin = NaverFinancePlugin()
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="research",
+    )
+
+    raw = {
+        "report_id": "market-123",
+        "category": "market",
+        "page": 2,
+        "title": "research",
+    }
+
+    record = plugin.normalize(
+        "research_report",
+        raw,
+        scope,
+    )
+
+    checkpoint = plugin.checkpoint_after_record(
+        "research_report",
+        scope,
+        raw,
+        record,
+        None,
+        None,
+    )
+
+    assert checkpoint.state["last_report_id"] == (
+        "market-123"
+    )
+
+    assert checkpoint.state["category"] == "market"
+
+    assert checkpoint.state["page"] == 2
+
+
+def test_attachment_checkpoint():
+
+    plugin = NaverFinancePlugin()
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="research",
+    )
+
+    raw = {
+        "attachment_id": "sha",
+        "parent_record_uid": "parent",
+        "sha256": "sha",
+        "report_id": "market-1",
+    }
+
+    record = plugin.normalize(
+        "attachment",
+        raw,
+        scope,
+    )
+
+    checkpoint = plugin.checkpoint_after_record(
+        "attachment",
+        scope,
+        raw,
+        record,
+        None,
+        None,
+    )
+
+    assert checkpoint.state[
+        "last_attachment_id"
+    ] == "sha"
+
+    assert checkpoint.state[
+        "last_report_id"
+    ] == "market-1"
+
 # ============================================================
 # Unknown dataset
 # ============================================================
@@ -545,6 +958,210 @@ class FakeForumClient:
             yield dict(
                 row
             )
+
+
+class FakeNewsClient:
+
+    def __init__(
+        self,
+        rows=None,
+    ):
+
+        self.rows = (
+            rows
+            or []
+        )
+
+        self.calls = []
+
+
+    async def crawl_pages(
+        self,
+        code,
+        *,
+        start_page=1,
+        max_pages=None,
+        mode="incremental",
+    ):
+
+        self.calls.append(
+            {
+                "code": code,
+                "start_page": (
+                    start_page
+                ),
+                "max_pages": (
+                    max_pages
+                ),
+                "mode": mode,
+            }
+        )
+
+        for row in self.rows:
+
+            yield dict(
+                row
+            )
+
+
+    async def crawl_relation_pages(
+        self,
+        code,
+        *,
+        start_page=1,
+        max_pages=None,
+    ):
+
+        self.calls.append(
+            {
+                "code": code,
+                "start_page": (
+                    start_page
+                ),
+                "max_pages": (
+                    max_pages
+                ),
+                "relation_only": True,
+            }
+        )
+
+        for row in self.rows:
+
+            yield dict(
+                row
+            )
+
+
+class FakeResearchClient:
+
+    def __init__(
+        self,
+        rows=None,
+    ):
+
+        self.rows = (
+            rows
+            or []
+        )
+
+        self.calls = []
+
+
+    async def crawl_pages(
+        self,
+        *,
+        categories=None,
+        start_page=1,
+        max_pages=None,
+        mode="incremental",
+    ):
+
+        self.calls.append(
+            {
+                "categories": categories,
+                "start_page": (
+                    start_page
+                ),
+                "max_pages": (
+                    max_pages
+                ),
+                "mode": mode,
+            }
+        )
+
+        for row in self.rows:
+
+            yield dict(
+                row
+            )
+
+
+    async def crawl_relation_pages(
+        self,
+        *,
+        categories=None,
+        start_page=1,
+        max_pages=None,
+        mode="incremental",
+    ):
+
+        self.calls.append(
+            {
+                "categories": categories,
+                "start_page": (
+                    start_page
+                ),
+                "max_pages": (
+                    max_pages
+                ),
+                "mode": mode,
+                "relation_only": True,
+            }
+        )
+
+        for row in self.rows:
+
+            yield dict(
+                row
+            )
+
+
+class FakeAttachment:
+
+    attachment_id = "sha"
+    parent_record_uid = "parent"
+    source_url = "https://example.com/report.pdf"
+    filename = "report.pdf"
+    mime_type = "application/pdf"
+    sha256 = "sha"
+    file_size = 12
+    local_path = Path(
+        "/tmp/report.pdf"
+    )
+
+
+class FakeUploadResult:
+
+    remote_path = "remote/report.pdf"
+    status = "verified"
+
+
+class FakeAttachmentPipeline:
+
+    def __init__(
+        self,
+    ):
+
+        self.calls = []
+
+
+    async def process(
+        self,
+        request,
+        *,
+        site_id,
+        country,
+        dataset,
+        event_time=None,
+        require_pdf=False,
+    ):
+
+        self.calls.append(
+            {
+                "request": request,
+                "site_id": site_id,
+                "country": country,
+                "dataset": dataset,
+                "event_time": event_time,
+                "require_pdf": require_pdf,
+            }
+        )
+
+        class Result:
+            attachment = FakeAttachment()
+            upload_result = FakeUploadResult()
+
+        return Result()
 
 
 # ============================================================
@@ -763,6 +1380,479 @@ def test_invalid_default_max_pages():
             forum_client=FakeForumClient(),
             default_forum_max_pages=0,
         )
+
+
+def test_invalid_default_news_max_pages():
+
+    with pytest.raises(
+        ValueError
+    ):
+
+        NaverFinancePlugin(
+            forum_client=FakeForumClient(),
+            news_client=FakeNewsClient(),
+            default_news_max_pages=0,
+        )
+
+
+def test_invalid_news_mode():
+
+    with pytest.raises(
+        ValueError
+    ):
+
+        NaverFinancePlugin(
+            forum_client=FakeForumClient(),
+            news_client=FakeNewsClient(),
+            news_mode="recent",
+        )
+
+
+@pytest.mark.asyncio
+async def test_news_crawl_accepts_unbounded_profile_max_pages():
+
+    client = FakeNewsClient(
+        rows=[]
+    )
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=client,
+        default_news_max_pages=1,
+    )
+
+    scope = CrawlScope(
+        scope_type="instrument",
+        source_key="005930",
+    )
+
+    async for _ in plugin.crawl(
+        "news_article",
+        scope,
+        None,
+        CrawlContext(
+            extra={
+                "news_max_pages": "all",
+            }
+        ),
+    ):
+
+        pass
+
+    assert client.calls[0][
+        "max_pages"
+    ] is None
+
+
+@pytest.mark.asyncio
+async def test_news_crawl_uses_real_client_surface():
+
+    client = FakeNewsClient(
+        rows=[
+            {
+                "article_id": "000123",
+                "office_id": "001",
+                "title": "hello news",
+                "content": "body",
+            }
+        ]
+    )
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=client,
+        default_news_max_pages=2,
+        news_mode="full",
+    )
+
+    scope = CrawlScope(
+        scope_type="instrument",
+        source_key="005930",
+        scope_id="XKRX:005930",
+        metadata={
+            "code": "005930",
+        },
+    )
+
+    rows = []
+
+    async for raw in plugin.crawl(
+        "news_article",
+        scope,
+        None,
+        None,
+    ):
+
+        rows.append(
+            raw
+        )
+
+    assert len(
+        rows
+    ) == 1
+
+    assert rows[0]["article_id"] == "000123"
+
+    assert rows[0]["code"] == "005930"
+
+    assert rows[0]["page"] == 1
+
+    assert client.calls[0] == {
+        "code": "005930",
+        "start_page": 1,
+        "max_pages": 2,
+        "mode": "full",
+    }
+
+
+@pytest.mark.asyncio
+async def test_news_crawl_resumes_page_and_context_overrides():
+
+    client = FakeNewsClient(
+        rows=[]
+    )
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=client,
+        default_news_max_pages=1,
+    )
+
+    scope = CrawlScope(
+        scope_type="instrument",
+        source_key="005930",
+    )
+
+    checkpoint = CrawlCheckpoint(
+        state={
+            "page": 7,
+            "last_article_id": "000123",
+        }
+    )
+
+    context = CrawlContext(
+        extra={
+            "news_max_pages": 5,
+            "news_mode": "full",
+        }
+    )
+
+    async for _ in plugin.crawl(
+        "news_article",
+        scope,
+        checkpoint,
+        context,
+    ):
+
+        pass
+
+    assert client.calls[0] == {
+        "code": "005930",
+        "start_page": 7,
+        "max_pages": 5,
+        "mode": "full",
+    }
+
+
+@pytest.mark.asyncio
+async def test_news_instrument_crawl_uses_relation_pages():
+
+    client = FakeNewsClient(
+        rows=[
+            {
+                "article_id": "000123",
+                "office_id": "001",
+                "title": "hello news",
+            }
+        ]
+    )
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=client,
+        default_news_max_pages=2,
+    )
+
+    scope = CrawlScope(
+        scope_type="instrument",
+        source_key="005930",
+        scope_id="XKRX:005930",
+    )
+
+    rows = [
+        row
+        async for row in plugin.crawl(
+            "news_instrument",
+            scope,
+            None,
+            None,
+        )
+    ]
+
+    assert rows[0]["article_id"] == "000123"
+
+    assert rows[0]["code"] == "005930"
+
+    assert client.calls[0] == {
+        "code": "005930",
+        "start_page": 1,
+        "max_pages": 2,
+        "relation_only": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_research_report_crawl_uses_client():
+
+    client = FakeResearchClient(
+        rows=[
+            {
+                "report_id": "market-123",
+                "category": "market",
+                "title": "research",
+            }
+        ]
+    )
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=FakeNewsClient(),
+        research_client=client,
+        default_research_max_pages=2,
+        research_mode="full",
+    )
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="research",
+    )
+
+    context = CrawlContext(
+        extra={
+            "research_categories": (
+                "market",
+                "company",
+            )
+        }
+    )
+
+    rows = [
+        row
+        async for row in plugin.crawl(
+            "research_report",
+            scope,
+            None,
+            context,
+        )
+    ]
+
+    assert rows[0]["report_id"] == "market-123"
+
+    assert rows[0]["page"] == 1
+
+    assert client.calls[0] == {
+        "categories": (
+            "market",
+            "company",
+        ),
+        "start_page": 1,
+        "max_pages": 2,
+        "mode": "full",
+    }
+
+
+@pytest.mark.asyncio
+async def test_research_instrument_crawl_uses_relation_pages():
+
+    client = FakeResearchClient(
+        rows=[
+            {
+                "report_id": "company-123",
+                "category": "company",
+                "instrument_id": "XKRX:005930",
+            }
+        ]
+    )
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=FakeNewsClient(),
+        research_client=client,
+        default_research_max_pages=2,
+    )
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="research",
+    )
+
+    rows = [
+        row
+        async for row in plugin.crawl(
+            "research_instrument",
+            scope,
+            None,
+            CrawlContext(
+                extra={
+                    "research_categories": (
+                        "company",
+                    )
+                }
+            ),
+        )
+    ]
+
+    assert rows[0]["report_id"] == "company-123"
+
+    assert rows[0]["page"] == 1
+
+    assert client.calls[0] == {
+        "categories": (
+            "company",
+        ),
+        "start_page": 1,
+        "max_pages": 2,
+        "mode": "incremental",
+        "relation_only": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_attachment_crawl_uses_generic_attachment_pipeline():
+
+    research_client = FakeResearchClient(
+        rows=[
+            {
+                "report_id": "market-1",
+                "category": "market",
+                "title": "research",
+                "published_at": "2026-08-07",
+                "summary": "body",
+                "source_url": (
+                    "https://finance.naver.com/"
+                    "research/market_info_read.naver?nid=1"
+                ),
+                "pdf_url": "https://example.com/report.pdf",
+                "pdf_filename": "report.pdf",
+            },
+            {
+                "report_id": "market-2",
+                "category": "market",
+                "title": "research 2",
+                "published_at": "2026-08-07",
+                "summary": "body",
+                "source_url": (
+                    "https://finance.naver.com/"
+                    "research/market_info_read.naver?nid=2"
+                ),
+                "pdf_url": "https://example.com/report2.pdf",
+                "pdf_filename": "report2.pdf",
+            }
+        ]
+    )
+
+    attachment_pipeline = FakeAttachmentPipeline()
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=FakeNewsClient(),
+        research_client=research_client,
+        attachment_pipeline=attachment_pipeline,
+    )
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="research",
+    )
+
+    rows = [
+        row
+        async for row in plugin.crawl(
+            "attachment",
+            scope,
+            None,
+            CrawlContext(
+                extra={
+                    "research_categories": (
+                        "market",
+                    ),
+                    "attachment_limit": 1,
+                }
+            ),
+        )
+    ]
+
+    assert rows[0]["attachment_id"] == "sha"
+
+    assert rows[0]["remote_path"] == "remote/report.pdf"
+
+    assert attachment_pipeline.calls[0][
+        "dataset"
+    ] == "research_report"
+
+    assert attachment_pipeline.calls[0][
+        "require_pdf"
+    ] is True
+
+    assert attachment_pipeline.calls[0][
+        "request"
+    ].source_url == "https://example.com/report.pdf"
+
+    assert len(
+        attachment_pipeline.calls
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_attachment_crawl_respects_download_research_pdf_false():
+
+    research_client = FakeResearchClient(
+        rows=[
+            {
+                "report_id": "market-1",
+                "category": "market",
+                "title": "research",
+                "published_at": "2026-08-07",
+                "summary": "body",
+                "source_url": (
+                    "https://finance.naver.com/"
+                    "research/market_info_read.naver?nid=1"
+                ),
+                "pdf_url": "https://example.com/report.pdf",
+                "pdf_filename": "report.pdf",
+            }
+        ]
+    )
+
+    attachment_pipeline = FakeAttachmentPipeline()
+
+    plugin = NaverFinancePlugin(
+        forum_client=FakeForumClient(),
+        news_client=FakeNewsClient(),
+        research_client=research_client,
+        attachment_pipeline=attachment_pipeline,
+    )
+
+    rows = [
+        row
+        async for row in plugin.crawl(
+            "attachment",
+            CrawlScope(
+                scope_type="global",
+                source_key="research",
+            ),
+            None,
+            CrawlContext(
+                extra={
+                    "download_research_pdf": False,
+                }
+            ),
+        )
+    ]
+
+    assert rows == []
+    assert attachment_pipeline.calls == []
+
 
 @pytest.mark.asyncio
 async def test_discover_instruments_from_context_extra():

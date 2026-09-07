@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+import requests
+
 from crawl_framework.core.adapter import (
     AttachmentRequest,
+)
+from crawl_framework.storage.uploader import (
+    BaseUploader,
+    UploadResult,
 )
 
 
@@ -61,6 +68,24 @@ class AttachmentRecord:
     fetched_at: datetime
 
 
+    @property
+    def relative_path(
+        self,
+    ) -> Path:
+
+        return Path(
+            self.remote_relative_path
+        )
+
+
+    @property
+    def file_path(
+        self,
+    ) -> Path:
+
+        return self.local_path
+
+
 class AttachmentDownloader(
     Protocol
 ):
@@ -70,6 +95,131 @@ class AttachmentDownloader(
         request: AttachmentRequest,
     ) -> AttachmentContent:
         ...
+
+
+class HTTPAttachmentDownloader:
+    """
+    Generic HTTP attachment downloader.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: float = 120,
+        retries: int = 3,
+        retry_sleep_seconds: float = 0.0,
+    ) -> None:
+
+        if timeout_seconds <= 0:
+
+            raise ValueError(
+                "timeout_seconds must be positive"
+            )
+
+        if retries <= 0:
+
+            raise ValueError(
+                "retries must be positive"
+            )
+
+        self.session = (
+            session
+            or requests.Session()
+        )
+
+        self.timeout_seconds = timeout_seconds
+
+        self.retries = retries
+
+        self.retry_sleep_seconds = retry_sleep_seconds
+
+
+    async def download(
+        self,
+        request: AttachmentRequest,
+    ) -> AttachmentContent:
+
+        last_error: Exception | None = None
+
+        for attempt in range(
+            self.retries
+        ):
+
+            try:
+
+                response = self.session.get(
+                    request.source_url,
+                    timeout=self.timeout_seconds,
+                )
+
+                status_code = int(
+                    getattr(
+                        response,
+                        "status_code",
+                        0,
+                    )
+                )
+
+                if status_code >= 400:
+
+                    raise AttachmentDownloadError(
+                        "attachment HTTP "
+                        f"{status_code}: "
+                        f"{request.source_url}"
+                    )
+
+                if hasattr(
+                    response,
+                    "raise_for_status",
+                ):
+
+                    response.raise_for_status()
+
+                headers = getattr(
+                    response,
+                    "headers",
+                    {},
+                )
+
+                return AttachmentContent(
+                    body=response.content,
+                    mime_type=(
+                        headers.get(
+                            "Content-Type"
+                        )
+                        if hasattr(
+                            headers,
+                            "get",
+                        )
+                        else None
+                    ),
+                    filename=request.filename,
+                )
+
+            except Exception as exc:
+
+                last_error = exc
+
+                if (
+                    attempt
+                    + 1
+                    >= self.retries
+                ):
+
+                    break
+
+                if self.retry_sleep_seconds > 0:
+
+                    time.sleep(
+                        self.retry_sleep_seconds
+                        * (attempt + 1)
+                    )
+
+        raise AttachmentDownloadError(
+            "attachment download failed: "
+            f"{last_error}"
+        )
 
 
 def attachment_sha256(
@@ -245,4 +395,69 @@ class LocalAttachmentStore:
             fetched_at=datetime.now(
                 timezone.utc
             ),
+        )
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
+class AttachmentProcessResult:
+    attachment: AttachmentRecord
+
+    upload_result: UploadResult
+
+
+class AttachmentPipeline:
+    """
+    Generic attachment durable pipeline.
+    """
+
+    def __init__(
+        self,
+        *,
+        downloader: AttachmentDownloader,
+        store: LocalAttachmentStore,
+        uploader: BaseUploader,
+    ) -> None:
+
+        self.downloader = downloader
+
+        self.store = store
+
+        self.uploader = uploader
+
+
+    async def process(
+        self,
+        request: AttachmentRequest,
+        *,
+        site_id: str,
+        country: str,
+        dataset: str,
+        event_time: datetime | None = None,
+        require_pdf: bool = False,
+    ) -> AttachmentProcessResult:
+
+        content = await self.downloader.download(
+            request
+        )
+
+        attachment = self.store.store(
+            request,
+            content,
+            site_id=site_id,
+            country=country,
+            dataset=dataset,
+            event_time=event_time,
+            require_pdf=require_pdf,
+        )
+
+        upload_result = self.uploader.upload(
+            attachment
+        )
+
+        return AttachmentProcessResult(
+            attachment=attachment,
+            upload_result=upload_result,
         )

@@ -10,10 +10,12 @@ from crawl_framework.cli.main import (
     EXIT_SUCCESS,
     CLIOptions,
     async_main,
+    build_run_manifest,
     build_parser,
     format_text_result,
     parse_args,
     run_recovery_only,
+    write_run_manifest,
 )
 from crawl_framework.core.bootstrap import (
     BootstrapResult,
@@ -193,6 +195,109 @@ def test_parse_minimal_args():
         options.instruments
         is None
     )
+
+
+def test_parse_naver_full_profile_expands_defaults():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--profile",
+            "naver_full",
+        ]
+    )
+
+    assert options.profile == "naver_full"
+    assert options.datasets == (
+        "forum_post",
+        "news_article",
+        "news_instrument",
+        "research_report",
+        "research_instrument",
+        "attachment",
+    )
+    assert options.instruments is not None
+    assert options.instruments[0] == "XKRX:005930"
+    assert options.news_mode == "full"
+    assert options.research_mode == "full"
+    assert options.forum_max_pages == 1
+    assert options.research_categories == (
+        "all",
+    )
+    assert options.download_research_pdf is True
+
+
+def test_parse_naver_incremental_profile_expands_defaults():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--profile",
+            "naver_incremental",
+        ]
+    )
+
+    assert options.profile == "naver_incremental"
+    assert options.news_mode == "incremental"
+    assert options.research_mode == "incremental"
+    assert options.instruments[0] == "XKRX:005930"
+
+
+def test_parse_profile_allows_explicit_scope_overrides():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--profile",
+            "naver_full",
+            "--dataset",
+            "news_article",
+            "--instrument",
+            "005930",
+            "--news-mode",
+            "incremental",
+            "--no-download-research-pdf",
+        ]
+    )
+
+    assert options.datasets == (
+        "news_article",
+    )
+    assert options.instruments == (
+        "005930",
+    )
+    assert options.news_mode == "incremental"
+    assert options.download_research_pdf is False
+
+
+def test_parse_run_manifest_options(
+    tmp_path,
+):
+
+    path = tmp_path / "manifest.json"
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--run-manifest",
+            "--run-manifest-path",
+            str(
+                path
+            ),
+        ]
+    )
+
+    assert options.run_manifest is True
+    assert options.run_manifest_path == path
+
 
 def test_parse_multiple_datasets():
 
@@ -675,6 +780,144 @@ def test_format_text_result():
         in text
     )
 
+
+def test_build_run_manifest_includes_universe_hash(
+    tmp_path,
+):
+
+    universe = tmp_path / "universe.txt"
+    universe.write_text(
+        "# header\nXKRX:005930\nXKRX:000660\n",
+        encoding="utf-8",
+    )
+
+    options = CLIOptions(
+        site="naver_finance",
+        profile="naver_incremental",
+        datasets=(
+            "news_article",
+        ),
+        flush_at_end=True,
+        json_output=True,
+        recovery_only=False,
+        instruments_file=universe,
+    )
+
+    manifest = build_run_manifest(
+        options=options,
+        result=make_bootstrap_result(),
+        run_id="run-1",
+    )
+
+    assert manifest[
+        "run_id"
+    ] == "run-1"
+
+    assert manifest[
+        "site"
+    ] == "naver_finance"
+
+    assert manifest[
+        "profile"
+    ] == "naver_incremental"
+
+    assert manifest[
+        "datasets"
+    ] == [
+        "news_article",
+    ]
+
+    assert manifest[
+        "universe"
+    ][
+        "count"
+    ] == 2
+
+    assert len(
+        manifest[
+            "universe"
+        ][
+            "sha256"
+        ]
+    ) == 64
+
+
+def test_write_run_manifest(
+    tmp_path,
+):
+
+    path = write_run_manifest(
+        {
+            "run_id": "run-1",
+            "site": "naver_finance",
+        },
+        path=tmp_path / "run.json",
+    )
+
+    assert path.exists()
+
+    payload = json.loads(
+        path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert payload[
+        "run_id"
+    ] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_async_main_writes_run_manifest(
+    tmp_path,
+):
+
+    bootstrap = FakeBootstrap()
+    manifest_path = tmp_path / "manifest.json"
+
+    def factory(
+        options,
+    ):
+
+        return bootstrap
+
+    result = await async_main(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "news_article",
+            "--run-manifest",
+            "--run-manifest-path",
+            str(
+                manifest_path
+            ),
+        ],
+        bootstrap_factory=factory,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert manifest_path.exists()
+
+    payload = json.loads(
+        manifest_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert payload[
+        "site"
+    ] == "naver_finance"
+
+    assert payload[
+        "datasets"
+    ] == [
+        "news_article",
+    ]
+
 # ============================================================
 # Instrument arguments
 # ============================================================
@@ -934,6 +1177,122 @@ def test_parse_max_pages():
     )
 
 
+def test_parse_dataset_specific_runtime_options():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--forum-max-pages",
+            "2",
+            "--news-max-pages",
+            "3",
+            "--news-mode",
+            "full",
+            "--research-max-pages",
+            "4",
+            "--research-mode",
+            "incremental",
+            "--download-research-pdf",
+            "--research-detail-workers",
+            "5",
+            "--pdf-workers",
+            "6",
+            "--forum-crawl-workers",
+            "7",
+            "--news-crawl-workers",
+            "8",
+            "--research-crawl-workers",
+            "9",
+            "--forum-http-concurrency",
+            "10",
+            "--news-http-concurrency",
+            "11",
+            "--research-http-concurrency",
+            "12",
+        ]
+    )
+
+    assert options.forum_max_pages == 2
+    assert options.news_max_pages == 3
+    assert options.news_mode == "full"
+    assert options.research_max_pages == 4
+    assert options.research_mode == "incremental"
+    assert options.download_research_pdf is True
+    assert options.research_detail_workers == 5
+    assert options.pdf_workers == 6
+    assert options.forum_crawl_workers == 7
+    assert options.news_crawl_workers == 8
+    assert options.research_crawl_workers == 9
+    assert options.forum_http_concurrency == 10
+    assert options.news_http_concurrency == 11
+    assert options.research_http_concurrency == 12
+
+
+def test_parse_progress_interval_seconds():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--progress-interval-seconds",
+            "0.5",
+        ]
+    )
+
+    assert options.progress_interval_seconds == 0.5
+
+
+def test_parse_progress_interval_seconds_rejects_zero():
+
+    with pytest.raises(
+        SystemExit
+    ):
+
+        parse_args(
+            [
+                "crawl",
+                "--site",
+                "naver_finance",
+                "--progress-interval-seconds",
+                "0",
+            ]
+        )
+
+
+def test_parse_no_download_research_pdf():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--no-download-research-pdf",
+        ]
+    )
+
+    assert options.download_research_pdf is False
+
+
+def test_parse_dataset_specific_max_pages_rejects_zero():
+
+    with pytest.raises(
+        SystemExit
+    ):
+
+        parse_args(
+            [
+                "crawl",
+                "--site",
+                "naver_finance",
+                "--news-max-pages",
+                "0",
+            ]
+        )
+
+
 def test_parse_max_pages_rejects_zero():
 
     import pytest
@@ -1102,6 +1461,128 @@ def test_parse_instrument_limit_uses_effective_prefix(
         options.instrument_limit
         == 2
     )
+
+
+def test_parse_crawl_can_enable_coalesced_scope_flushes():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "forum_post",
+            "--coalesce-scope-flushes",
+        ]
+    )
+
+    assert (
+        options.coalesce_scope_flushes
+        is True
+    )
+
+
+def test_parse_crawl_can_trust_rsync_success():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "forum_post",
+            "--trust-rsync-success",
+        ]
+    )
+
+    assert (
+        options.trust_rsync_success
+        is True
+    )
+
+
+def test_parse_crawl_can_enable_ssh_multiplex():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "forum_post",
+            "--ssh-multiplex",
+        ]
+    )
+
+    assert (
+        options.ssh_multiplex
+        is True
+    )
+
+
+def test_parse_crawl_can_enable_post_dataset_compaction():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "forum_post",
+            "--compact-after-dataset",
+            "--compaction-min-file-count",
+            "3",
+        ]
+    )
+
+    assert (
+        options.compact_after_dataset
+        is True
+    )
+
+    assert (
+        options.compaction_min_file_count
+        == 3
+    )
+
+
+def test_parse_research_category_preserves_stable_order():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--dataset",
+            "research_report",
+            "--research-category",
+            "market",
+            "--research-category",
+            "company",
+            "--research-category",
+            "market",
+        ]
+    )
+
+    assert options.research_categories == (
+        "market",
+        "company",
+    )
+
+
+def test_parse_attachment_limit():
+
+    options = parse_args(
+        [
+            "crawl",
+            "--site",
+            "naver_finance",
+            "--attachment-limit",
+            "1",
+        ]
+    )
+
+    assert options.attachment_limit == 1
 
 
 def test_parse_instrument_limit_rejects_zero():

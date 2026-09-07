@@ -111,6 +111,12 @@ class SyncConfig:
 
     ssh_port: int = 22
 
+    ssh_multiplex: bool = False
+
+    ssh_control_path: str | None = None
+
+    ssh_control_persist: str = "10m"
+
 
 # ============================================================
 # Local
@@ -450,6 +456,30 @@ def load_config(
                 22,
             )
         ),
+        ssh_multiplex=bool(
+            rsync_raw.get(
+                "ssh_multiplex",
+                False,
+            )
+        ),
+        ssh_control_path=(
+            str(
+                rsync_raw.get(
+                    "ssh_control_path"
+                )
+            ).strip()
+            if rsync_raw.get(
+                "ssh_control_path"
+            )
+            is not None
+            else None
+        ),
+        ssh_control_persist=str(
+            rsync_raw.get(
+                "ssh_control_persist",
+                "10m",
+            )
+        ).strip(),
     )
 
     # ========================================================

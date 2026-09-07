@@ -12,7 +12,6 @@ from crawl_framework.core.adapter import (
 from crawl_framework.core.models import (
     CanonicalRecord,
     InstrumentRef,
-    RecordRelation,
 )
 from crawl_framework.core.plugin import (
     CrawlCheckpoint,
@@ -85,6 +84,7 @@ class NaverFinanceAdapter(
             "news_instrument",
             "research_report",
             "research_instrument",
+            "attachment",
         )
 
 
@@ -116,6 +116,9 @@ class NaverFinanceAdapter(
             ),
             AdapterCapability(
                 dataset="research_instrument",
+            ),
+            AdapterCapability(
+                dataset="attachment",
             ),
         )
 
@@ -150,7 +153,10 @@ class NaverFinanceAdapter(
     ]:
 
         if (
-            dataset == "news_article"
+            dataset in {
+                "news_article",
+                "news_instrument",
+            }
             and self.news_client is not None
         ):
 
@@ -215,7 +221,10 @@ class NaverFinanceAdapter(
     ) -> RawFetchResult:
 
         if (
-            dataset == "news_article"
+            dataset in {
+                "news_article",
+                "news_instrument",
+            }
             and self.news_client is not None
         ):
 
@@ -299,25 +308,17 @@ class NaverFinanceAdapter(
         scope: CrawlScope,
     ) -> CanonicalRecord | None:
 
-        if dataset == "news_article":
+        if dataset in {
+            "attachment",
+            "forum_post",
+            "news_article",
+            "news_instrument",
+            "research_report",
+            "research_instrument",
+        }:
 
             return self.legacy_plugin.normalize(
                 dataset,
-                raw.payload,
-                scope,
-            )
-
-        if dataset == "forum_post":
-
-            return self.legacy_plugin.normalize(
-                dataset,
-                raw.payload,
-                scope,
-            )
-
-        if dataset == "research_report":
-
-            return self._normalize_research_report(
                 raw.payload,
                 scope,
             )
@@ -384,122 +385,3 @@ class NaverFinanceAdapter(
                     "dataset": dataset,
                 },
             )
-
-
-    def _normalize_research_report(
-        self,
-        raw,
-        scope: CrawlScope,
-    ) -> CanonicalRecord:
-
-        if not isinstance(
-            raw,
-            dict,
-        ):
-
-            raise TypeError(
-                "research_report raw payload must be a dict"
-            )
-
-        report_id = str(
-            raw.get(
-                "report_id"
-            )
-            or raw.get(
-                "source_id"
-            )
-            or ""
-        ).strip()
-
-        if not report_id:
-
-            raise ValueError(
-                "research_report requires report_id"
-            )
-
-        raw_instruments = (
-            raw.get(
-                "instrument_ids"
-            )
-            or []
-        )
-
-        relations = [
-            RecordRelation(
-                instrument_id=str(
-                    instrument_id
-                ).strip(),
-                relation_type="related",
-            )
-            for instrument_id in raw_instruments
-            if str(
-                instrument_id
-            ).strip()
-        ]
-
-        instrument_id = (
-            relations[0].instrument_id
-            if len(
-                relations
-            )
-            == 1
-            else None
-        )
-
-        return CanonicalRecord(
-            site_id=self.site_id,
-            country=self.country,
-            dataset="research_report",
-            source_id=report_id,
-            scope_type=(
-                scope.scope_type
-            ),
-            scope_id=(
-                scope.scope_id
-            ),
-            instrument_id=instrument_id,
-            event_time=(
-                raw.get(
-                    "published_at"
-                )
-                or raw.get(
-                    "event_time"
-                )
-            ),
-            title=raw.get(
-                "title"
-            ),
-            content=(
-                raw.get(
-                    "summary"
-                )
-                or raw.get(
-                    "abstract"
-                )
-            ),
-            author_name=raw.get(
-                "analyst"
-            ),
-            source_url=raw.get(
-                "source_url"
-            ),
-            payload={
-                "report_id": report_id,
-                "institution": raw.get(
-                    "institution"
-                ),
-                "analyst": raw.get(
-                    "analyst"
-                ),
-                "pdf_url": raw.get(
-                    "pdf_url"
-                ),
-                "summary": raw.get(
-                    "summary"
-                ),
-                "abstract": raw.get(
-                    "abstract"
-                ),
-            },
-            relations=relations,
-        )

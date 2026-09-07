@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Any, Iterable, Protocol
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -82,6 +82,34 @@ class CompactionResult:
     duplicate_rows_removed: int
 
     dry_run: bool
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
+class CompactionRunSummary:
+    """
+    Production-safe summary for one compaction run.
+    """
+
+    site_id: str
+
+    dataset: str
+
+    groups: int
+
+    source_files: int
+
+    replacement_files: int
+
+    source_rows: int
+
+    replacement_rows: int
+
+    duplicate_rows_removed: int
+
+    dry_run: bool = False
 
 
 class CompactionUploader(Protocol):
@@ -350,22 +378,47 @@ def deduplicate_table(
 
 def _read_group_table(
     group: CompactionGroup,
+    *,
+    local_root: str | Path | None = None,
 ) -> pa.Table:
 
     tables = []
 
     for item in group.files:
 
+        read_path: Path | str | None = None
+
+        if local_root is not None:
+
+            candidate = (
+                Path(
+                    local_root
+                )
+                / str(
+                    item.file_path
+                )
+            )
+
+            if candidate.exists():
+
+                read_path = candidate
+
         if not item.remote_path:
 
-            raise ValueError(
-                "active uploaded file has empty remote_path: "
-                f"{item.file_path}"
-            )
+            if read_path is None:
+
+                raise ValueError(
+                    "active uploaded file has empty remote_path: "
+                    f"{item.file_path}"
+                )
+
+        if read_path is None:
+
+            read_path = item.remote_path
 
         tables.append(
             pq.read_table(
-                item.remote_path
+                read_path
             )
         )
 
@@ -467,6 +520,7 @@ def write_compacted_group(
     group: CompactionGroup,
     *,
     output_root: str | Path,
+    source_root: str | Path | None = None,
     dry_run: bool = False,
     compression: str = "zstd",
 ) -> CompactionResult:
@@ -482,7 +536,8 @@ def write_compacted_group(
     )
 
     table = _read_group_table(
-        group
+        group,
+        local_root=source_root,
     )
 
     compacted = deduplicate_table(
@@ -645,10 +700,35 @@ def publish_compaction_result(
 
         return None
 
-    remote_path = uploader.upload_file(
-        result.output.file_path,
-        result.output.relative_path,
-    )
+    if hasattr(
+        uploader,
+        "upload",
+    ):
+
+        upload_result = uploader.upload(
+            result.output
+        )
+
+        if upload_result.status not in {
+            "uploaded",
+            "verified",
+        }:
+
+            raise RuntimeError(
+                "unexpected compaction upload status: "
+                f"{upload_result.status!r}"
+            )
+
+        remote_path = str(
+            upload_result.remote_path
+        )
+
+    else:
+
+        remote_path = uploader.upload_file(
+            result.output.file_path,
+            result.output.relative_path,
+        )
 
     record = DataFileRecord.from_parquet_info(
         result.output
@@ -675,3 +755,101 @@ def publish_compaction_result(
         )
 
     return remote_path
+
+
+def compact_active_dataset(
+    *,
+    catalog: Any,
+    uploader: Any,
+    site_id: str,
+    dataset: str,
+    country: str | None = None,
+    warehouse_root: str | Path,
+    min_file_count: int = 2,
+    dry_run: bool = False,
+    compression: str = "zstd",
+) -> CompactionRunSummary:
+    """
+    Compact currently active uploaded files for one dataset.
+
+    The grouping boundary remains the storage partition:
+
+        site/country/dataset/partition_date/bucket
+
+    That keeps existing query and bucket semantics intact while replacing
+    multiple small active files with one active replacement per group.
+    """
+
+    files = catalog.list_active_data_files(
+        site_id=site_id,
+        country=country,
+        dataset=dataset,
+    )
+
+    plan = build_compaction_plan(
+        files,
+        min_file_count=min_file_count,
+    )
+
+    replacement_files = 0
+    replacement_rows = 0
+    duplicate_rows_removed = 0
+
+    for group in plan.groups:
+
+        result = write_compacted_group(
+            group,
+            output_root=warehouse_root,
+            source_root=warehouse_root,
+            dry_run=dry_run,
+            compression=compression,
+        )
+
+        if result.output is not None:
+
+            replacement_files += 1
+
+        replacement_rows += int(
+            result.replacement_rows
+        )
+
+        duplicate_rows_removed += int(
+            result.duplicate_rows_removed
+        )
+
+        publish_compaction_result(
+            result,
+            catalog=catalog,
+            uploader=uploader,
+            dry_run=dry_run,
+        )
+
+    return CompactionRunSummary(
+        site_id=str(
+            site_id
+        ),
+        dataset=str(
+            dataset
+        ),
+        groups=len(
+            plan.groups
+        ),
+        source_files=(
+            plan.source_file_count
+        ),
+        replacement_files=(
+            replacement_files
+        ),
+        source_rows=(
+            plan.source_row_count
+        ),
+        replacement_rows=(
+            replacement_rows
+        ),
+        duplicate_rows_removed=(
+            duplicate_rows_removed
+        ),
+        dry_run=bool(
+            dry_run
+        ),
+    )

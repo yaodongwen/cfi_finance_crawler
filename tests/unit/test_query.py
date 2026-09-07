@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from datetime import (
     date,
     datetime,
@@ -317,6 +319,108 @@ def write_test_parquet(
     return table
 
 
+def write_relation_news_parquet(
+    path,
+):
+    table = pa.table(
+        {
+            "record_uid":
+                pa.array(
+                    [
+                        "uid-news-a",
+                        "uid-news-b",
+                    ],
+                    type=pa.string(),
+                ),
+
+            "instrument_id":
+                pa.array(
+                    [
+                        None,
+                        None,
+                    ],
+                    type=pa.string(),
+                ),
+
+            "event_time":
+                pa.array(
+                    [
+                        datetime(
+                            2026,
+                            8,
+                            25,
+                            10,
+                            0,
+                            tzinfo=UTC,
+                        ),
+                        datetime(
+                            2026,
+                            8,
+                            25,
+                            11,
+                            0,
+                            tzinfo=UTC,
+                        ),
+                    ],
+                    type=pa.timestamp(
+                        "us",
+                        tz="UTC",
+                    ),
+                ),
+
+            "title":
+                pa.array(
+                    [
+                        "Samsung relation news",
+                        "Hynix relation news",
+                    ],
+                    type=pa.string(),
+                ),
+
+            "relations_json":
+                pa.array(
+                    [
+                        json.dumps(
+                            [
+                                {
+                                    "instrument_id": (
+                                        "XKRX:005930"
+                                    ),
+                                    "relation_type": (
+                                        "primary"
+                                    ),
+                                    "confidence": 1.0,
+                                }
+                            ]
+                        ),
+                        json.dumps(
+                            [
+                                {
+                                    "instrument_id": (
+                                        "XKRX:000660"
+                                    ),
+                                    "relation_type": (
+                                        "primary"
+                                    ),
+                                    "confidence": 1.0,
+                                }
+                            ]
+                        ),
+                    ],
+                    type=pa.string(),
+                ),
+        }
+    )
+
+    pq.write_table(
+        table,
+        path,
+        write_statistics=True,
+    )
+
+    return table
+
+
 # ============================================================
 # Query normalization
 # ============================================================
@@ -568,6 +672,91 @@ def test_query_filters_instrument_and_date(
         result.stats.rows_returned
         ==
         1
+    )
+
+
+def test_query_news_article_matches_relations_json(
+    tmp_path,
+):
+
+    parquet_path = (
+        tmp_path
+        /
+        "news.parquet"
+    )
+
+    table = write_relation_news_parquet(
+        parquet_path
+    )
+
+    item = FakeCatalogFile(
+        file_id=1,
+        file_path="news.parquet",
+        remote_path=str(
+            parquet_path
+        ),
+        row_count=(
+            table.num_rows
+        ),
+        file_size=(
+            parquet_path
+            .stat()
+            .st_size
+        ),
+        partition_date=date(
+            2026,
+            8,
+            25,
+        ),
+    )
+
+    catalog = FakeCatalog(
+        {
+            "2026-08-25":
+                [
+                    item,
+                ],
+        }
+    )
+
+    reader = CatalogParquetReader(
+        catalog=catalog,
+        resolver=CatalogFileResolver(),
+    )
+
+    result = reader.query(
+        QuerySpec(
+            site_id="naver_finance",
+            dataset="news_article",
+            country="KR",
+            instrument_id="XKRX:005930",
+            start_date="2026-08-25",
+            end_date="2026-08-25",
+            columns=(
+                "record_uid",
+                "instrument_id",
+                "event_time",
+                "title",
+                "relations_json",
+            ),
+        )
+    )
+
+    assert result.table.num_rows == 1
+
+    row = result.table.to_pylist()[0]
+
+    assert row["record_uid"] == "uid-news-a"
+
+    assert row["instrument_id"] is None
+
+    assert row["title"] == "Samsung relation news"
+
+    assert (
+        catalog.calls[0][
+            "bucket"
+        ]
+        is None
     )
 
 
@@ -1606,6 +1795,103 @@ def test_iter_batches_applies_filters(
         [
             "keep-1",
             "keep-2",
+        ]
+    )
+
+
+def test_iter_batches_news_article_matches_relations_json(
+    tmp_path,
+):
+
+    parquet_path = (
+        tmp_path
+        /
+        "news-stream.parquet"
+    )
+
+    table = write_relation_news_parquet(
+        parquet_path
+    )
+
+    item = FakeCatalogFile(
+        file_id=1,
+        file_path="news-stream.parquet",
+        remote_path=str(
+            parquet_path
+        ),
+        row_count=(
+            table.num_rows
+        ),
+        file_size=(
+            parquet_path
+            .stat()
+            .st_size
+        ),
+        partition_date=date(
+            2026,
+            8,
+            25,
+        ),
+    )
+
+    catalog = FakeCatalog(
+        {
+            "2026-08-25":
+                [
+                    item,
+                ],
+        }
+    )
+
+    reader = CatalogParquetReader(
+        catalog=catalog,
+        resolver=CatalogFileResolver(),
+    )
+
+    batches = list(
+        reader.iter_batches(
+            QuerySpec(
+                site_id="naver_finance",
+                dataset="news_article",
+                country="KR",
+                instrument_id="XKRX:000660",
+                start_date="2026-08-25",
+                end_date="2026-08-25",
+                columns=(
+                    "record_uid",
+                    "instrument_id",
+                    "event_time",
+                    "title",
+                    "relations_json",
+                ),
+            ),
+            batch_size=2,
+        )
+    )
+
+    result = pa.Table.from_batches(
+        batches
+    )
+
+    assert (
+        result[
+            "record_uid"
+        ]
+        .to_pylist()
+        ==
+        [
+            "uid-news-b",
+        ]
+    )
+
+    assert (
+        result[
+            "instrument_id"
+        ]
+        .to_pylist()
+        ==
+        [
+            None,
         ]
     )
 

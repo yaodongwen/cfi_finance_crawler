@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -416,6 +417,14 @@ class RsyncUploader(
         dry_run: bool = False,
         verify_size: bool = True,
         verify_sha256: bool = False,
+        trust_rsync_success: bool = False,
+        cache_remote_directories: bool = True,
+        ssh_multiplex: bool = False,
+        ssh_control_path: str | None = None,
+        ssh_control_persist: str = "10m",
+        command_timeout_seconds: float = 120.0,
+        command_attempts: int = 2,
+        retry_sleep_seconds: float = 1.0,
         rsync_binary: str = "rsync",
         ssh_binary: str = "ssh",
     ) -> None:
@@ -454,6 +463,50 @@ class RsyncUploader(
             verify_sha256
         )
 
+        self.trust_rsync_success = bool(
+            trust_rsync_success
+        )
+
+        self.cache_remote_directories = bool(
+            cache_remote_directories
+        )
+
+        self._ensured_remote_directories: set[str] = set()
+
+        self.ssh_multiplex = bool(
+            ssh_multiplex
+        )
+
+        self.ssh_control_path = (
+            str(
+                ssh_control_path
+            ).strip()
+            if ssh_control_path
+            else None
+        )
+
+        self.ssh_control_persist = str(
+            ssh_control_persist
+        ).strip()
+
+        self.command_timeout_seconds = float(
+            command_timeout_seconds
+        )
+
+        self.command_attempts = max(
+            1,
+            int(
+                command_attempts
+            ),
+        )
+
+        self.retry_sleep_seconds = max(
+            0.0,
+            float(
+                retry_sleep_seconds
+            ),
+        )
+
         self.rsync_binary = (
             rsync_binary
         )
@@ -481,6 +534,14 @@ class RsyncUploader(
                 "invalid ssh_port"
             )
 
+        if (
+            self.ssh_multiplex
+            and not self.ssh_control_persist
+        ):
+            raise ValueError(
+                "ssh_control_persist cannot be empty"
+            )
+
 
     @property
     def ssh_target(
@@ -495,6 +556,52 @@ class RsyncUploader(
             )
 
         return self.remote_host
+
+    def ssh_options(
+        self,
+    ) -> list[str]:
+
+        options = [
+            "-p",
+            str(
+                self.ssh_port
+            ),
+        ]
+
+        if not self.ssh_multiplex:
+            return options
+
+        control_path = (
+            self.ssh_control_path
+            or (
+                "/tmp/cfw-%C"
+            )
+        )
+
+        options.extend(
+            [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                f"ControlPersist={self.ssh_control_persist}",
+                "-o",
+                f"ControlPath={control_path}",
+            ]
+        )
+
+        return options
+
+
+    def ssh_command_text(
+        self,
+    ) -> str:
+
+        return " ".join(
+            [
+                self.ssh_binary,
+                *self.ssh_options(),
+            ]
+        )
 
 
     def remote_file_path(
@@ -560,10 +667,7 @@ class RsyncUploader(
         command.extend(
             [
                 "-e",
-                (
-                    f"{self.ssh_binary} "
-                    f"-p {self.ssh_port}"
-                ),
+                self.ssh_command_text(),
                 str(
                     info.file_path
                 ),
@@ -590,10 +694,7 @@ class RsyncUploader(
 
         return [
             self.ssh_binary,
-            "-p",
-            str(
-                self.ssh_port
-            ),
+            *self.ssh_options(),
             self.ssh_target,
             "mkdir",
             "-p",
@@ -606,11 +707,82 @@ class RsyncUploader(
         command: list[str],
     ) -> subprocess.CompletedProcess:
 
-        return subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
+        last_result: subprocess.CompletedProcess | None = None
+
+        for attempt in range(
+            1,
+            self.command_attempts + 1,
+        ):
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=self.command_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                result = subprocess.CompletedProcess(
+                    command,
+                    124,
+                    stdout=(
+                        exc.stdout
+                        if isinstance(exc.stdout, str)
+                        else ""
+                    ),
+                    stderr=(
+                        "command timed out after "
+                        f"{self.command_timeout_seconds:g}s"
+                    ),
+                )
+
+            last_result = result
+
+            if result.returncode == 0:
+                return result
+
+            if attempt < self.command_attempts:
+                time.sleep(
+                    self.retry_sleep_seconds
+                )
+
+        assert last_result is not None
+        return last_result
+
+    @staticmethod
+    def _clean_stderr(
+        stderr: str,
+    ) -> str:
+        """
+        Remove known non-fatal remote shell noise from stderr.
+        """
+
+        lines = []
+
+        for line in str(
+            stderr
+            or ""
+        ).splitlines():
+
+            text = line.strip()
+
+            if not text:
+
+                continue
+
+            if (
+                "setlocale: LC_ALL: cannot change locale"
+                in text
+            ):
+
+                continue
+
+            lines.append(
+                text
+            )
+
+        return "\n".join(
+            lines
         )
 
 
@@ -620,6 +792,16 @@ class RsyncUploader(
     ) -> None:
 
         if self.dry_run:
+            return
+
+        remote_dir = self.remote_directory(
+            info
+        )
+
+        if (
+            self.cache_remote_directories
+            and remote_dir in self._ensured_remote_directories
+        ):
             return
 
         command = (
@@ -636,7 +818,12 @@ class RsyncUploader(
 
             raise UploadError(
                 "remote mkdir failed: "
-                f"{result.stderr.strip()}"
+                f"{self._clean_stderr(result.stderr) or 'unknown error'}"
+            )
+
+        if self.cache_remote_directories:
+            self._ensured_remote_directories.add(
+                remote_dir
             )
 
 
@@ -647,10 +834,7 @@ class RsyncUploader(
 
         command = [
             self.ssh_binary,
-            "-p",
-            str(
-                self.ssh_port
-            ),
+            *self.ssh_options(),
             self.ssh_target,
             "stat",
             "-c",
@@ -666,7 +850,7 @@ class RsyncUploader(
 
             raise UploadError(
                 "remote stat failed: "
-                f"{result.stderr.strip()}"
+                f"{self._clean_stderr(result.stderr)}"
             )
 
         text = (
@@ -693,10 +877,7 @@ class RsyncUploader(
 
         command = [
             self.ssh_binary,
-            "-p",
-            str(
-                self.ssh_port
-            ),
+            *self.ssh_options(),
             self.ssh_target,
             "sha256sum",
             remote_path,
@@ -804,13 +985,19 @@ class RsyncUploader(
                 f"returncode="
                 f"{result.returncode}, "
                 f"stderr="
-                f"{result.stderr.strip()}"
+                f"{self._clean_stderr(result.stderr)}"
             )
 
         remote_size = None
         remote_sha256 = None
 
-        if self.verify_size:
+        if (
+            self.trust_rsync_success
+            and not self.verify_sha256
+        ):
+            remote_size = local_size
+
+        elif self.verify_size:
 
             remote_size = (
                 self._remote_stat_size(
@@ -851,6 +1038,7 @@ class RsyncUploader(
         if (
             self.verify_size
             or self.verify_sha256
+            or self.trust_rsync_success
         ):
             status = "verified"
 

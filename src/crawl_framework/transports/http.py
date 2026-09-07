@@ -6,6 +6,9 @@ from typing import Any, Awaitable, Callable
 from crawl_framework.transports.proxy import (
     ProxyPool,
 )
+from crawl_framework.transports.rate_limit import (
+    AdaptiveRateLimiter,
+)
 
 
 HttpRequester = Callable[
@@ -54,10 +57,12 @@ class HttpTransport:
         *,
         requester: HttpRequester,
         proxy_pool: ProxyPool | None = None,
+        rate_limiter: AdaptiveRateLimiter | None = None,
     ) -> None:
 
         self.requester = requester
         self.proxy_pool = proxy_pool
+        self.rate_limiter = rate_limiter
 
 
     async def request(
@@ -70,6 +75,12 @@ class HttpTransport:
             if self.proxy_pool is not None
             else None
         )
+
+        if self.rate_limiter is not None:
+
+            self.rate_limiter.before_request(
+                request.url
+            )
 
         kwargs = {
             "method": request.method,
@@ -92,6 +103,12 @@ class HttpTransport:
 
         except Exception:
 
+            if self.rate_limiter is not None:
+
+                self.rate_limiter.record_failure(
+                    request.url
+                )
+
             if (
                 self.proxy_pool is not None
                 and proxy is not None
@@ -102,6 +119,46 @@ class HttpTransport:
                 )
 
             raise
+
+        status_code = int(
+            getattr(
+                response,
+                "status_code",
+                0,
+            )
+            or 0
+        )
+
+        if self.rate_limiter is not None:
+
+            if status_code in {
+                403,
+                429,
+                500,
+                502,
+                503,
+                504,
+            }:
+
+                self.rate_limiter.record_failure(
+                    request.url,
+                    throttled=(
+                        status_code
+                        in {
+                            403,
+                            429,
+                        }
+                    ),
+                )
+
+            elif (
+                status_code
+                and status_code < 400
+            ):
+
+                self.rate_limiter.record_success(
+                    request.url
+                )
 
         if (
             self.proxy_pool is not None

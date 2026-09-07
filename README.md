@@ -16,6 +16,274 @@
 
 ---
 
+# 0. 当前使用方法与能力范围
+
+## 环境
+
+本仓库当前验证环境：
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate pac
+```
+
+运行单元测试：
+
+```bash
+pytest -q -p no:rerunfailures tests/unit
+```
+
+最新已验证基线：
+
+```text
+642 passed
+```
+
+## Naver 一键 Profile
+
+当前 production CLI 的权威入口是：
+
+```bash
+python -m crawl_framework.cli.main crawl
+```
+
+Naver 支持两个一键 profile：
+
+```text
+naver_full
+naver_incremental
+```
+
+`naver_full` 覆盖当前 Naver 内容面：
+
+```text
+forum_post
+news_article
+news_instrument
+research_report
+research_instrument
+attachment
+```
+
+默认 instrument universe 来自：
+
+```text
+config/universes/naver_finance_kr_rollout_universe.txt
+```
+
+当前 universe 为 3924 个 canonical Korean instruments，格式：
+
+```text
+XKRX:005930
+```
+
+## 推荐 Production 命令
+
+当前推荐的 I16 full-content production 命令：
+
+```bash
+python -m crawl_framework.cli.main crawl \
+  --site naver_finance \
+  --profile naver_full \
+  --crawl-workers 16 \
+  --writer-workers 4 \
+  --upload-workers 2 \
+  --catalog-workers 4 \
+  --attachment-workers 4 \
+  --target-file-size-mb 16 \
+  --coalesce-scope-flushes \
+  --trust-rsync-success \
+  --ssh-multiplex \
+  --compact-after-dataset \
+  --compaction-min-file-count 2 \
+  --progress-interval-seconds 60 \
+  --run-manifest \
+  --run-manifest-path state/run_manifests/naver_full_i16_YYYYMMDDTHHMMSSZ.json
+```
+
+这些关键参数的含义：
+
+```text
+--coalesce-scope-flushes
+  大规模 rollout 时不在每个 instrument scope 完成后强制 flush，
+  降低小 Parquet 文件数量；checkpoint 会等待对应 batch 完成
+  upload/Catalog 后再提交。
+
+--trust-rsync-success
+  rsync exit code 成功时跳过每文件额外 ssh stat，Catalog 仍记录
+  本地 file size 和 sha256。
+
+--ssh-multiplex
+  使用 OpenSSH ControlMaster 复用 SSH 连接，降低大量小文件上传时
+  每个 rsync/mkdir/stat 的连接建立成本。默认 ControlPath 为
+  /tmp/cfw-%C，避免 macOS Unix socket path too long。
+
+--compact-after-dataset
+  每个 dataset drain 完成后执行 generic compaction，把同一
+  site/country/dataset/day/bucket 分区内的多个 active uploaded
+  小 Parquet 合成 replacement Parquet。
+
+--compaction-min-file-count 2
+  同一分区至少有 2 个 active 文件时才压缩。
+```
+
+## 中断恢复
+
+Production run 可以中断后恢复。
+
+恢复命令：
+
+```bash
+python -m crawl_framework.cli.main crawl \
+  --site naver_finance \
+  --profile naver_full \
+  --recovery-only \
+  --run-manifest \
+  --run-manifest-path state/run_manifests/naver_full_recovery_YYYYMMDDTHHMMSSZ.json
+```
+
+期望健康输出：
+
+```text
+success=True
+remaining=0
+```
+
+或者 JSON/manifest 中：
+
+```text
+remaining_pending=0
+terminal_failed=0
+```
+
+恢复语义：
+
+```text
+write
+-> upload
+-> verify
+-> Catalog/index
+-> SeenStore
+-> checkpoint
+-> cleanup eligibility
+```
+
+中断后 recovery 会从 recovery manifest 中恢复未完成的 durable
+batch，不需要重新设计 crawl 逻辑。
+
+## 小文件与 PostgreSQL Catalog 语义
+
+PostgreSQL Catalog 是 file-level Catalog：
+
+```text
+一行 data_files 记录 = 一个 Parquet 数据文件
+```
+
+它不是：
+
+```text
+一条新闻一行
+一条讨论帖一行
+一条评论一行
+```
+
+如果 Parquet 文件过小，Catalog active 行数也会被放大。因此当前
+推荐 production run 启用：
+
+```text
+--coalesce-scope-flushes
+--compact-after-dataset
+```
+
+自动 compaction 的安全边界：
+
+```text
+只在同一 site/country/dataset/partition_date/bucket 内合并
+不跨日期合并
+不跨 bucket 合并
+不改变当前 query bucket pruning 语义
+不直接删除 NAS 上的旧物理文件
+```
+
+发布顺序：
+
+```text
+write compacted replacement
+-> upload replacement
+-> register replacement
+-> mark replacement uploaded
+-> mark source small files superseded
+```
+
+查询侧只读取：
+
+```text
+storage_status = uploaded
+lifecycle_status = active
+```
+
+因此 compaction 后，源小文件不会再作为 active 查询面出现。
+
+## 当前能力范围
+
+已经真实接入 production plugin/CLI 的 Naver dataset：
+
+```text
+forum_post
+news_article
+news_instrument
+research_report
+research_instrument
+attachment
+```
+
+已经完成真实生产验证：
+
+```text
+full 3924-instrument forum_post rollout
+50-instrument full-content smoke
+research six-category small smoke
+single PDF attachment smoke
+```
+
+正在进行但尚未最终验收：
+
+```text
+I16 naver_full full-market all-content production run
+post-dataset compaction production effect
+full news/research/PDF scale validation
+```
+
+框架通用能力：
+
+```text
+bounded concurrent production runtime
+backpressure queues
+configurable crawl/writer/upload/catalog workers
+SeenStore
+checkpoint
+recovery manifests
+Parquet writer
+rsync/NAS uploader
+PostgreSQL file Catalog
+record side index
+query layer
+generic compaction
+generic cleanup/repair/recovery
+generic attachment pipeline
+```
+
+站点插件只应实现：
+
+```text
+instrument discovery
+site fetch
+site normalize
+attachment discovery
+```
+
+---
+
 # 1. 当前项目位置
 
 本项目根目录：

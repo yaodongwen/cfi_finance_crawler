@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
+import uuid
 
 from dataclasses import (
     asdict,
     dataclass,
+)
+from datetime import (
+    datetime,
+    timezone,
 )
 from pathlib import Path
 from typing import (
@@ -21,6 +27,30 @@ from typing import (
 from crawl_framework.core.bootstrap import (
     BootstrapResult,
     CrawlBootstrap,
+)
+
+
+NAVER_FULL_PROFILE_DATASETS = (
+    "forum_post",
+    "news_article",
+    "news_instrument",
+    "research_report",
+    "research_instrument",
+    "attachment",
+)
+
+NAVER_INCREMENTAL_PROFILE_DATASETS = (
+    "forum_post",
+    "news_article",
+    "news_instrument",
+    "research_report",
+    "research_instrument",
+    "attachment",
+)
+
+NAVER_ROLLOUT_UNIVERSE_PATH = Path(
+    "config/universes/"
+    "naver_finance_kr_rollout_universe.txt"
 )
 
 
@@ -140,6 +170,8 @@ class CLIOptions:
 
     recovery_only: bool
 
+    profile: str | None = None
+
     instruments: tuple[
         str,
         ...,
@@ -148,6 +180,40 @@ class CLIOptions:
     instruments_file: Path | None = None
 
     max_pages: int | None = None
+
+    forum_max_pages: int | None = None
+
+    news_max_pages: int | None = None
+
+    research_max_pages: int | None = None
+
+    news_mode: str | None = None
+
+    research_mode: str | None = None
+
+    download_research_pdf: bool | None = None
+
+    research_detail_workers: int | None = None
+
+    pdf_workers: int | None = None
+
+    forum_crawl_workers: int | None = None
+
+    news_crawl_workers: int | None = None
+
+    research_crawl_workers: int | None = None
+
+    forum_http_concurrency: int | None = None
+
+    news_http_concurrency: int | None = None
+
+    research_http_concurrency: int | None = None
+
+    progress_interval_seconds: float | None = None
+
+    run_manifest: bool = False
+
+    run_manifest_path: Path | None = None
 
     crawl_workers: int | None = None
 
@@ -163,7 +229,24 @@ class CLIOptions:
 
     target_file_size_mb: int | None = None
 
+    coalesce_scope_flushes: bool = False
+
+    trust_rsync_success: bool = False
+
+    ssh_multiplex: bool = False
+
+    compact_after_dataset: bool = False
+
+    compaction_min_file_count: int | None = None
+
     instrument_limit: int | None = None
+
+    research_categories: tuple[
+        str,
+        ...
+    ] | None = None
+
+    attachment_limit: int | None = None
 
 # ============================================================
 # Factory protocol
@@ -242,6 +325,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--profile",
+        choices=(
+            "naver_full",
+            "naver_incremental",
+        ),
+        default=None,
+        help=(
+            "Named production crawl profile."
+        ),
+    )
+
     # ========================================================
     # Dataset
     # ========================================================
@@ -317,8 +412,83 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     for option_name in (
+        "forum-max-pages",
+        "news-max-pages",
+        "research-max-pages",
+    ):
+
+        parser.add_argument(
+            f"--{option_name}",
+            dest=option_name.replace(
+                "-",
+                "_",
+            ),
+            type=int,
+            default=None,
+            help=(
+                "Dataset-specific positive page "
+                "limit override."
+            ),
+        )
+
+    parser.add_argument(
+        "--news-mode",
+        dest="news_mode",
+        choices=(
+            "incremental",
+            "full",
+        ),
+        default=None,
+        help=(
+            "Naver news crawl mode."
+        ),
+    )
+
+    parser.add_argument(
+        "--research-mode",
+        dest="research_mode",
+        choices=(
+            "incremental",
+            "full",
+        ),
+        default=None,
+        help=(
+            "Naver research crawl mode."
+        ),
+    )
+
+    parser.add_argument(
+        "--download-research-pdf",
+        dest="download_research_pdf",
+        action="store_true",
+        default=None,
+        help=(
+            "Enable Naver research PDF attachment "
+            "downloads for this run."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-download-research-pdf",
+        dest="download_research_pdf",
+        action="store_false",
+        help=(
+            "Disable Naver research PDF attachment "
+            "downloads for this run."
+        ),
+    )
+
+    for option_name in (
         "crawl-workers",
         "attachment-workers",
+        "research-detail-workers",
+        "pdf-workers",
+        "forum-crawl-workers",
+        "news-crawl-workers",
+        "research-crawl-workers",
+        "forum-http-concurrency",
+        "news-http-concurrency",
+        "research-http-concurrency",
         "writer-workers",
         "upload-workers",
         "catalog-workers",
@@ -339,6 +509,58 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+    parser.add_argument(
+        "--research-category",
+        dest="research_categories",
+        action="append",
+        default=None,
+        help=(
+            "Naver research category to crawl. "
+            "Can be supplied multiple times. "
+            "Use all to crawl every supported category."
+        ),
+    )
+
+    parser.add_argument(
+        "--attachment-limit",
+        dest="attachment_limit",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of attachments to process "
+            "during this run. Must be positive."
+        ),
+    )
+
+    parser.add_argument(
+        "--progress-interval-seconds",
+        dest="progress_interval_seconds",
+        type=float,
+        default=None,
+        help=(
+            "Print live production progress every N "
+            "seconds. Positive number."
+        ),
+    )
+
+    parser.add_argument(
+        "--run-manifest",
+        action="store_true",
+        help=(
+            "Write a JSON run manifest. Profiles "
+            "enable this by default."
+        ),
+    )
+
+    parser.add_argument(
+        "--run-manifest-path",
+        default=None,
+        help=(
+            "Path for the JSON run manifest. "
+            "Defaults to state/run_manifests/<run_id>.json."
+        ),
+    )
+
     # ========================================================
     # Flush
     # ========================================================
@@ -349,6 +571,59 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Do not flush all remaining "
             "buffered records at runtime exit."
+        ),
+    )
+
+    parser.add_argument(
+        "--coalesce-scope-flushes",
+        action="store_true",
+        help=(
+            "Do not force a Parquet flush whenever a "
+            "scope finishes. Completed scopes wait for "
+            "size/age/final batch flush, reducing small "
+            "files in large production rollouts."
+        ),
+    )
+
+    parser.add_argument(
+        "--trust-rsync-success",
+        action="store_true",
+        help=(
+            "For rsync production uploads, treat a successful "
+            "rsync exit code as verified and skip the extra "
+            "per-file remote stat check. Catalog still records "
+            "local file size and sha256."
+        ),
+    )
+
+    parser.add_argument(
+        "--ssh-multiplex",
+        action="store_true",
+        help=(
+            "Use OpenSSH ControlMaster multiplexing for rsync "
+            "production uploads. This reduces connection setup "
+            "overhead for many small files."
+        ),
+    )
+
+    parser.add_argument(
+        "--compact-after-dataset",
+        action="store_true",
+        help=(
+            "After each dataset finishes, compact active uploaded "
+            "small Parquet files per storage partition and mark "
+            "source files superseded in Catalog."
+        ),
+    )
+
+    parser.add_argument(
+        "--compaction-min-file-count",
+        dest="compaction_min_file_count",
+        type=int,
+        default=None,
+        help=(
+            "Minimum active files in a partition before automatic "
+            "post-dataset compaction runs. Must be positive."
         ),
     )
 
@@ -449,6 +724,86 @@ def parse_args(
         parser.error(
             "--site cannot be empty"
         )
+
+    profile = args.profile
+
+    if (
+        profile is not None
+        and site != "naver_finance"
+    ):
+
+        parser.error(
+            "--profile is currently supported "
+            "only for --site naver_finance"
+        )
+
+    if profile == "naver_full":
+
+        if args.datasets is None:
+
+            args.datasets = list(
+                NAVER_FULL_PROFILE_DATASETS
+            )
+
+        if args.instruments is None and args.instruments_file is None:
+
+            args.instruments_file = str(
+                NAVER_ROLLOUT_UNIVERSE_PATH
+            )
+
+        if args.news_mode is None:
+
+            args.news_mode = "full"
+
+        if args.research_mode is None:
+
+            args.research_mode = "full"
+
+        if args.research_categories is None:
+
+            args.research_categories = [
+                "all",
+            ]
+
+        if args.forum_max_pages is None:
+
+            args.forum_max_pages = 1
+
+        if args.download_research_pdf is None:
+
+            args.download_research_pdf = True
+
+    elif profile == "naver_incremental":
+
+        if args.datasets is None:
+
+            args.datasets = list(
+                NAVER_INCREMENTAL_PROFILE_DATASETS
+            )
+
+        if args.instruments is None and args.instruments_file is None:
+
+            args.instruments_file = str(
+                NAVER_ROLLOUT_UNIVERSE_PATH
+            )
+
+        if args.news_mode is None:
+
+            args.news_mode = "incremental"
+
+        if args.research_mode is None:
+
+            args.research_mode = "incremental"
+
+        if args.research_categories is None:
+
+            args.research_categories = [
+                "all",
+            ]
+
+        if args.download_research_pdf is None:
+
+            args.download_research_pdf = True
 
     # ========================================================
     # Helper:
@@ -572,6 +927,10 @@ def parse_args(
         )
     )
 
+    research_categories = normalize_repeated(
+        args.research_categories
+    )
+
     # ========================================================
     # Instruments
     # ========================================================
@@ -679,12 +1038,78 @@ def parse_args(
 
         return value
 
+    attachment_limit = positive_optional_int(
+        "attachment_limit"
+    )
+
+    forum_max_pages = positive_optional_int(
+        "forum_max_pages"
+    )
+
+    news_max_pages = positive_optional_int(
+        "news_max_pages"
+    )
+
+    research_max_pages = positive_optional_int(
+        "research_max_pages"
+    )
+
+    research_detail_workers = positive_optional_int(
+        "research_detail_workers"
+    )
+
+    pdf_workers = positive_optional_int(
+        "pdf_workers"
+    )
+
+    forum_crawl_workers = positive_optional_int(
+        "forum_crawl_workers"
+    )
+
+    news_crawl_workers = positive_optional_int(
+        "news_crawl_workers"
+    )
+
+    research_crawl_workers = positive_optional_int(
+        "research_crawl_workers"
+    )
+
+    forum_http_concurrency = positive_optional_int(
+        "forum_http_concurrency"
+    )
+
+    news_http_concurrency = positive_optional_int(
+        "news_http_concurrency"
+    )
+
+    research_http_concurrency = positive_optional_int(
+        "research_http_concurrency"
+    )
+
+    progress_interval_seconds = (
+        args.progress_interval_seconds
+    )
+
+    if progress_interval_seconds is not None:
+
+        progress_interval_seconds = float(
+            progress_interval_seconds
+        )
+
+        if progress_interval_seconds <= 0:
+
+            parser.error(
+                "--progress-interval-seconds "
+                "must be positive"
+            )
+
     # ========================================================
     # Return
     # ========================================================
 
     return CLIOptions(
         site=site,
+        profile=profile,
         datasets=datasets,
         flush_at_end=(
             not args.no_final_flush
@@ -704,6 +1129,32 @@ def parse_args(
             else None
         ),
         max_pages=max_pages,
+        forum_max_pages=forum_max_pages,
+        news_max_pages=news_max_pages,
+        research_max_pages=research_max_pages,
+        news_mode=args.news_mode,
+        research_mode=args.research_mode,
+        download_research_pdf=args.download_research_pdf,
+        research_detail_workers=research_detail_workers,
+        pdf_workers=pdf_workers,
+        forum_crawl_workers=forum_crawl_workers,
+        news_crawl_workers=news_crawl_workers,
+        research_crawl_workers=research_crawl_workers,
+        forum_http_concurrency=forum_http_concurrency,
+        news_http_concurrency=news_http_concurrency,
+        research_http_concurrency=research_http_concurrency,
+        progress_interval_seconds=progress_interval_seconds,
+        run_manifest=(
+            bool(args.run_manifest)
+            or profile is not None
+        ),
+        run_manifest_path=(
+            Path(
+                args.run_manifest_path
+            ).expanduser()
+            if args.run_manifest_path
+            else None
+        ),
         crawl_workers=positive_optional_int(
             "crawl_workers"
         ),
@@ -725,7 +1176,26 @@ def parse_args(
         target_file_size_mb=positive_optional_int(
             "target_file_size_mb"
         ),
+        coalesce_scope_flushes=(
+            bool(args.coalesce_scope_flushes)
+        ),
+        trust_rsync_success=(
+            bool(args.trust_rsync_success)
+        ),
+        ssh_multiplex=(
+            bool(args.ssh_multiplex)
+        ),
+        compact_after_dataset=(
+            bool(args.compact_after_dataset)
+        ),
+        compaction_min_file_count=positive_optional_int(
+            "compaction_min_file_count"
+        ),
         instrument_limit=instrument_limit,
+        research_categories=(
+            research_categories
+        ),
+        attachment_limit=attachment_limit,
     )
     
 
@@ -790,6 +1260,159 @@ def bootstrap_result_to_dict(
         "runtime": _json_safe(
             result.runtime
         ),
+    }
+
+
+def build_run_manifest(
+    *,
+    options: CLIOptions,
+    result: BootstrapResult,
+    run_id: str | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+) -> dict[
+    str,
+    Any,
+]:
+
+    run_id = (
+        run_id
+        or uuid.uuid4().hex
+    )
+
+    started_at = (
+        started_at
+        or datetime.now(
+            timezone.utc
+        )
+    )
+
+    finished_at = (
+        finished_at
+        or datetime.now(
+            timezone.utc
+        )
+    )
+
+    universe = _universe_metadata(
+        options.instruments_file
+    )
+
+    return {
+        "run_id": run_id,
+        "site": options.site,
+        "profile": options.profile,
+        "datasets": list(
+            options.datasets
+            or ()
+        ),
+        "universe": universe,
+        "options": _json_safe(
+            options
+        ),
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "success": result.success,
+        "crawler_started": result.crawler_started,
+        "recovery": bootstrap_result_to_dict(
+            result
+        )[
+            "recovery"
+        ],
+        "runtime": _json_safe(
+            result.runtime
+        ),
+    }
+
+
+def write_run_manifest(
+    manifest: dict[
+        str,
+        Any,
+    ],
+    *,
+    path: Path | None = None,
+) -> Path:
+
+    output_path = (
+        path
+        or Path(
+            "state/run_manifests"
+        )
+        / f"{manifest['run_id']}.json"
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    output_path.write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return output_path
+
+
+def _universe_metadata(
+    path: Path | None,
+) -> dict[
+    str,
+    Any,
+] | None:
+
+    if path is None:
+
+        return None
+
+    try:
+
+        data = path.read_bytes()
+
+    except OSError as exc:
+
+        return {
+            "path": str(
+                path
+            ),
+            "error": str(
+                exc
+            ),
+        }
+
+    count = 0
+
+    for line in data.decode(
+        "utf-8",
+        errors="replace",
+    ).splitlines():
+
+        stripped = line.strip()
+
+        if (
+            stripped
+            and not stripped.startswith(
+                "#"
+            )
+        ):
+
+            count += 1
+
+    return {
+        "path": str(
+            path
+        ),
+        "sha256": hashlib.sha256(
+            data
+        ).hexdigest(),
+        "count": count,
     }
 
 
@@ -1070,6 +1693,10 @@ async def async_main(
 
     try:
 
+        started_at = datetime.now(
+            timezone.utc
+        )
+
         # ====================================================
         # Recovery only
         # ====================================================
@@ -1099,6 +1726,10 @@ async def async_main(
                 )
             )
 
+        finished_at = datetime.now(
+            timezone.utc
+        )
+
     except Exception as exc:
 
         message = (
@@ -1117,6 +1748,42 @@ async def async_main(
             ),
             message=message,
         )
+
+    if options.run_manifest:
+
+        try:
+
+            manifest = build_run_manifest(
+                options=options,
+                result=result,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+
+            manifest_path = write_run_manifest(
+                manifest,
+                path=options.run_manifest_path,
+            )
+            del manifest_path
+
+        except Exception as exc:
+
+            message = (
+                "run manifest write failed: "
+                f"{exc}"
+            )
+
+            print(
+                message,
+                file=stderr,
+            )
+
+            return CLIResult(
+                exit_code=(
+                    EXIT_RUNTIME_ERROR
+                ),
+                message=message,
+            )
 
     print_bootstrap_result(
         result,

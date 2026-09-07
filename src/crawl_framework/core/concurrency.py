@@ -47,6 +47,45 @@ class StageConcurrencyConfig:
     frozen=True,
     slots=True,
 )
+class DatasetResourceBudget:
+    crawl_workers: int | None = None
+
+    http_concurrency: int | None = None
+
+    detail_workers: int | None = None
+
+    attachment_workers: int | None = None
+
+    def __post_init__(
+        self,
+    ) -> None:
+
+        for name in (
+            "crawl_workers",
+            "http_concurrency",
+            "detail_workers",
+            "attachment_workers",
+        ):
+
+            value = getattr(
+                self,
+                name,
+            )
+
+            if (
+                value is not None
+                and value < 1
+            ):
+
+                raise ValueError(
+                    f"{name} must be >= 1"
+                )
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
 class QueueSizeConfig:
     records: int = 1000
 

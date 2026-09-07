@@ -11,6 +11,7 @@ from typing import (
 
 from crawl_framework.core.models import (
     CanonicalRecord,
+    RecordRelation,
 )
 
 from crawl_framework.core.plugin import (
@@ -89,18 +90,58 @@ class NaverFinancePlugin(
         self,
         *,
         forum_client=None,
+        news_client=None,
+        research_client=None,
+        attachment_pipeline=None,
+        rate_limiter=None,
         default_forum_max_pages: int | None = 1,
+        default_news_max_pages: int | None = 1,
+        default_research_max_pages: int | None = 1,
         fetch_forum_detail: bool = True,
+        news_mode: str = "incremental",
+        research_mode: str = "incremental",
     ) -> None:
 
         from crawl_framework.sites.naver_finance.forum_post import (
             NaverForumClient,
         )
+        from crawl_framework.sites.naver_finance.news import (
+            NaverNewsClient,
+        )
+        from crawl_framework.sites.naver_finance.research import (
+            NaverResearchClient,
+        )
+        from crawl_framework.transports.rate_limit import (
+            AdaptiveRateLimiter,
+        )
+
+        self.rate_limiter = (
+            rate_limiter
+            or AdaptiveRateLimiter()
+        )
 
         self.forum_client = (
             forum_client
-            or NaverForumClient()
+            or NaverForumClient(
+                rate_limiter=self.rate_limiter,
+            )
         )
+
+        self.news_client = (
+            news_client
+            or NaverNewsClient(
+                rate_limiter=self.rate_limiter,
+            )
+        )
+
+        self.research_client = (
+            research_client
+            or NaverResearchClient(
+                rate_limiter=self.rate_limiter,
+            )
+        )
+
+        self.attachment_pipeline = attachment_pipeline
 
         if (
             default_forum_max_pages
@@ -117,8 +158,74 @@ class NaverFinancePlugin(
             default_forum_max_pages
         )
 
+        if (
+            default_news_max_pages
+            is not None
+            and default_news_max_pages <= 0
+        ):
+
+            raise ValueError(
+                "default_news_max_pages "
+                "must be positive"
+            )
+
+        self.default_news_max_pages = (
+            default_news_max_pages
+        )
+
+        if (
+            default_research_max_pages
+            is not None
+            and default_research_max_pages <= 0
+        ):
+
+            raise ValueError(
+                "default_research_max_pages "
+                "must be positive"
+            )
+
+        self.default_research_max_pages = (
+            default_research_max_pages
+        )
+
         self.fetch_forum_detail = (
             fetch_forum_detail
+        )
+
+        normalized_news_mode = str(
+            news_mode
+        ).strip().lower()
+
+        if normalized_news_mode not in {
+            "full",
+            "incremental",
+        }:
+
+            raise ValueError(
+                "news_mode must be full "
+                "or incremental"
+            )
+
+        self.news_mode = (
+            normalized_news_mode
+        )
+
+        normalized_research_mode = str(
+            research_mode
+        ).strip().lower()
+
+        if normalized_research_mode not in {
+            "full",
+            "incremental",
+        }:
+
+            raise ValueError(
+                "research_mode must be full "
+                "or incremental"
+            )
+
+        self.research_mode = (
+            normalized_research_mode
         )
 
     @staticmethod
@@ -306,7 +413,10 @@ class NaverFinancePlugin(
         # News
         # ====================================================
 
-        elif dataset == "news_article":
+        elif dataset in {
+            "news_article",
+            "news_instrument",
+        }:
 
             article_id = str(
                 raw.get(
@@ -342,6 +452,138 @@ class NaverFinancePlugin(
                 state[
                     "last_office_id"
                 ] = office_id
+
+            page = raw.get(
+                "page"
+            )
+
+            if page is not None:
+
+                try:
+
+                    page = int(
+                        page
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+
+                    page = None
+
+            if (
+                page is not None
+                and page > 0
+            ):
+
+                state[
+                    "page"
+                ] = page
+
+        elif dataset in {
+            "research_report",
+            "research_instrument",
+        }:
+
+            report_id = str(
+                raw.get(
+                    "report_id"
+                )
+                or raw.get(
+                    "source_id"
+                )
+                or record.source_id
+            ).strip()
+
+            if not report_id:
+
+                raise ValueError(
+                    "cannot create research "
+                    "checkpoint without report_id"
+                )
+
+            state[
+                "last_report_id"
+            ] = report_id
+
+            category = self._optional_text(
+                raw.get(
+                    "category"
+                )
+                or raw.get(
+                    "report_type"
+                )
+            )
+
+            if category:
+
+                state[
+                    "category"
+                ] = category
+
+            page = raw.get(
+                "page"
+            )
+
+            if page is not None:
+
+                try:
+
+                    page = int(
+                        page
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+
+                    page = None
+
+            if (
+                page is not None
+                and page > 0
+            ):
+
+                state[
+                    "page"
+                ] = page
+
+        elif dataset == "attachment":
+
+            attachment_id = str(
+                raw.get(
+                    "attachment_id"
+                )
+                or raw.get(
+                    "sha256"
+                )
+                or record.source_id
+            ).strip()
+
+            if not attachment_id:
+
+                raise ValueError(
+                    "cannot create attachment "
+                    "checkpoint without attachment_id"
+                )
+
+            state[
+                "last_attachment_id"
+            ] = attachment_id
+
+            report_id = self._optional_text(
+                raw.get(
+                    "report_id"
+                )
+            )
+
+            if report_id:
+
+                state[
+                    "last_report_id"
+                ] = report_id
 
         # ====================================================
         # Fallback
@@ -469,6 +711,21 @@ class NaverFinancePlugin(
                 self.default_forum_max_pages
             )
 
+        if (
+            isinstance(
+                value,
+                str,
+            )
+            and value.strip().lower()
+            in {
+                "all",
+                "none",
+                "unbounded",
+            }
+        ):
+
+            return None
+
         try:
 
             value = int(
@@ -527,6 +784,276 @@ class NaverFinancePlugin(
 
         return (
             self.fetch_forum_detail
+        )
+
+
+    # ========================================================
+    # News checkpoint helpers
+    # ========================================================
+
+    def _news_start_page(
+        self,
+        checkpoint: CrawlCheckpoint | None,
+    ) -> int:
+        """
+        Resume news at the last persisted page.
+
+        This deliberately replays the page at-least-once;
+        SeenStore handles de-duplication after normalization.
+        """
+
+        return self._forum_start_page(
+            checkpoint
+        )
+
+
+    def _news_max_pages(
+        self,
+        context: CrawlContext | None,
+    ) -> int | None:
+
+        extra = self._context_extra(
+            context
+        )
+
+        value = extra.get(
+            "news_max_pages"
+        )
+
+        if value is None:
+
+            return (
+                self.default_news_max_pages
+            )
+
+        if (
+            isinstance(
+                value,
+                str,
+            )
+            and value.strip().lower()
+            in {
+                "all",
+                "none",
+                "unbounded",
+            }
+        ):
+
+            return None
+
+        try:
+
+            value = int(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            raise ValueError(
+                "news_max_pages "
+                "must be an integer"
+            ) from exc
+
+        if value <= 0:
+
+            raise ValueError(
+                "news_max_pages "
+                "must be positive"
+            )
+
+        return value
+
+
+    def _news_mode(
+        self,
+        context: CrawlContext | None,
+    ) -> str:
+
+        extra = self._context_extra(
+            context
+        )
+
+        value = extra.get(
+            "news_mode"
+        )
+
+        if value is None:
+
+            return self.news_mode
+
+        value = str(
+            value
+        ).strip().lower()
+
+        if value not in {
+            "full",
+            "incremental",
+        }:
+
+            raise ValueError(
+                "news_mode must be full "
+                "or incremental"
+            )
+
+        return value
+
+
+    # ========================================================
+    # Research helpers
+    # ========================================================
+
+    def _research_start_page(
+        self,
+        checkpoint: CrawlCheckpoint | None,
+    ) -> int:
+
+        return self._forum_start_page(
+            checkpoint
+        )
+
+
+    def _research_max_pages(
+        self,
+        context: CrawlContext | None,
+    ) -> int | None:
+
+        extra = self._context_extra(
+            context
+        )
+
+        value = extra.get(
+            "research_max_pages"
+        )
+
+        if value is None:
+
+            return (
+                self.default_research_max_pages
+            )
+
+        if (
+            isinstance(
+                value,
+                str,
+            )
+            and value.strip().lower()
+            in {
+                "all",
+                "none",
+                "unbounded",
+            }
+        ):
+
+            return None
+
+        try:
+
+            value = int(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            raise ValueError(
+                "research_max_pages "
+                "must be an integer"
+            ) from exc
+
+        if value <= 0:
+
+            raise ValueError(
+                "research_max_pages "
+                "must be positive"
+            )
+
+        return value
+
+
+    def _research_mode(
+        self,
+        context: CrawlContext | None,
+    ) -> str:
+
+        extra = self._context_extra(
+            context
+        )
+
+        value = extra.get(
+            "research_mode"
+        )
+
+        if value is None:
+
+            return self.research_mode
+
+        value = str(
+            value
+        ).strip().lower()
+
+        if value not in {
+            "full",
+            "incremental",
+        }:
+
+            raise ValueError(
+                "research_mode must be full "
+                "or incremental"
+            )
+
+        return value
+
+
+    def _research_categories(
+        self,
+        context: CrawlContext | None,
+    ):
+
+        extra = self._context_extra(
+            context
+        )
+
+        return extra.get(
+            "research_categories"
+        )
+
+
+    def _download_research_pdf(
+        self,
+        context: CrawlContext | None,
+    ) -> bool:
+
+        extra = self._context_extra(
+            context
+        )
+
+        value = extra.get(
+            "download_research_pdf"
+        )
+
+        if value is None:
+
+            return True
+
+        if isinstance(
+            value,
+            str,
+        ):
+
+            return value.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+
+        return bool(
+            value
         )
 
 
@@ -707,6 +1234,10 @@ class NaverFinancePlugin(
         return (
             "forum_post",
             "news_article",
+            "news_instrument",
+            "research_report",
+            "research_instrument",
+            "attachment",
         )
 
 
@@ -749,6 +1280,24 @@ class NaverFinancePlugin(
                 f"unsupported dataset: "
                 f"{dataset!r}"
             )
+
+        if dataset in {
+            "research_report",
+            "research_instrument",
+            "attachment",
+        }:
+
+            yield CrawlScope(
+                scope_type="global",
+                source_key="research",
+                scope_id=None,
+                metadata={
+                    "site_id": self.site_id,
+                    "dataset": dataset,
+                },
+            )
+
+            return
 
         codes = (
             self._instrument_codes_from_context(
@@ -800,7 +1349,8 @@ class NaverFinancePlugin(
             抓取讨论区列表和帖子详情。
 
         news_article:
-            当前暂未接真实 crawler。
+            使用 NaverNewsClient.crawl_pages()
+            抓取每只股票的新闻列表与正文。
 
         forum_post checkpoint:
             如果存在 checkpoint.state["page"]，
@@ -900,12 +1450,393 @@ class NaverFinancePlugin(
 
         if dataset == "news_article":
 
-            # 真实 news crawler 下一阶段迁入。
-            #
-            # 保证函数仍然是 async generator。
-            if False:
+            code = self._scope_code(
+                scope
+            )
 
-                yield {}
+            start_page = (
+                self._news_start_page(
+                    checkpoint
+                )
+            )
+
+            max_pages = (
+                self._news_max_pages(
+                    context
+                )
+            )
+
+            mode = (
+                self._news_mode(
+                    context
+                )
+            )
+
+            async for raw in (
+                self.news_client
+                .crawl_pages(
+                    code,
+                    start_page=start_page,
+                    max_pages=max_pages,
+                    mode=mode,
+                )
+            ):
+
+                if not raw.get(
+                    "code"
+                ):
+
+                    raw[
+                        "code"
+                    ] = code
+
+                if raw.get(
+                    "page"
+                ) is None:
+
+                    raw[
+                        "page"
+                    ] = start_page
+
+                yield raw
+
+            return
+
+        # ====================================================
+        # News instruments
+        # ====================================================
+
+        if dataset == "news_instrument":
+
+            code = self._scope_code(
+                scope
+            )
+
+            start_page = (
+                self._news_start_page(
+                    checkpoint
+                )
+            )
+
+            max_pages = (
+                self._news_max_pages(
+                    context
+                )
+            )
+
+            async for raw in (
+                self.news_client
+                .crawl_relation_pages(
+                    code,
+                    start_page=start_page,
+                    max_pages=max_pages,
+                )
+            ):
+
+                if not raw.get(
+                    "code"
+                ):
+
+                    raw[
+                        "code"
+                    ] = code
+
+                if raw.get(
+                    "page"
+                ) is None:
+
+                    raw[
+                        "page"
+                    ] = start_page
+
+                yield raw
+
+            return
+
+        # ====================================================
+        # Research reports
+        # ====================================================
+
+        if dataset == "research_report":
+
+            start_page = (
+                self._research_start_page(
+                    checkpoint
+                )
+            )
+
+            max_pages = (
+                self._research_max_pages(
+                    context
+                )
+            )
+
+            mode = (
+                self._research_mode(
+                    context
+                )
+            )
+
+            categories = (
+                self._research_categories(
+                    context
+                )
+            )
+
+            async for raw in (
+                self.research_client
+                .crawl_pages(
+                    categories=categories,
+                    start_page=start_page,
+                    max_pages=max_pages,
+                    mode=mode,
+                )
+            ):
+
+                if raw.get(
+                    "page"
+                ) is None:
+
+                    raw[
+                        "page"
+                    ] = start_page
+
+                yield raw
+
+            return
+
+        # ====================================================
+        # Research instruments
+        # ====================================================
+
+        if dataset == "research_instrument":
+
+            start_page = (
+                self._research_start_page(
+                    checkpoint
+                )
+            )
+
+            max_pages = (
+                self._research_max_pages(
+                    context
+                )
+            )
+
+            mode = (
+                self._research_mode(
+                    context
+                )
+            )
+
+            categories = (
+                self._research_categories(
+                    context
+                )
+            )
+
+            async for raw in (
+                self.research_client
+                .crawl_relation_pages(
+                    categories=categories,
+                    start_page=start_page,
+                    max_pages=max_pages,
+                    mode=mode,
+                )
+            ):
+
+                if raw.get(
+                    "page"
+                ) is None:
+
+                    raw[
+                        "page"
+                    ] = start_page
+
+                yield raw
+
+            return
+
+        # ====================================================
+        # Research PDF attachments
+        # ====================================================
+
+        if dataset == "attachment":
+
+            if not self._download_research_pdf(
+                context
+            ):
+
+                return
+
+            if self.attachment_pipeline is None:
+
+                raise RuntimeError(
+                    "attachment pipeline is not configured"
+                )
+
+            from crawl_framework.core.adapter import (
+                AttachmentRequest,
+            )
+
+            start_page = (
+                self._research_start_page(
+                    checkpoint
+                )
+            )
+
+            max_pages = (
+                self._research_max_pages(
+                    context
+                )
+            )
+
+            mode = (
+                self._research_mode(
+                    context
+                )
+            )
+
+            categories = (
+                self._research_categories(
+                    context
+                )
+            )
+
+            extra = self._context_extra(
+                context
+            )
+
+            attachment_limit = extra.get(
+                "attachment_limit"
+            )
+
+            if attachment_limit is not None:
+
+                attachment_limit = int(
+                    attachment_limit
+                )
+
+                if attachment_limit <= 0:
+
+                    raise ValueError(
+                        "attachment_limit must be positive"
+                    )
+
+            processed_attachments = 0
+
+            async for raw_report in (
+                self.research_client
+                .crawl_pages(
+                    categories=categories,
+                    start_page=start_page,
+                    max_pages=max_pages,
+                    mode=mode,
+                )
+            ):
+
+                pdf_url = self._optional_text(
+                    raw_report.get(
+                        "pdf_url"
+                    )
+                )
+
+                if not pdf_url:
+
+                    continue
+
+                if (
+                    attachment_limit is not None
+                    and processed_attachments
+                    >= attachment_limit
+                ):
+
+                    break
+
+                parent_record = (
+                    self._normalize_research_report(
+                        raw_report,
+                        scope,
+                    )
+                )
+
+                request = AttachmentRequest(
+                    parent_record_uid=(
+                        parent_record.record_uid
+                    ),
+                    source_url=pdf_url,
+                    filename=(
+                        raw_report.get(
+                            "pdf_filename"
+                        )
+                    ),
+                    mime_type="application/pdf",
+                    metadata={
+                        "site_id": self.site_id,
+                        "country": self.country,
+                        "dataset": "research_report",
+                        "report_id": raw_report.get(
+                            "report_id"
+                        ),
+                        "category": (
+                            raw_report.get(
+                                "category"
+                            )
+                            or raw_report.get(
+                                "report_type"
+                            )
+                        ),
+                    },
+                )
+
+                result = await self.attachment_pipeline.process(
+                    request,
+                    site_id=self.site_id,
+                    country=self.country,
+                    dataset="research_report",
+                    event_time=parent_record.event_time,
+                    require_pdf=True,
+                )
+
+                attachment = result.attachment
+
+                yield {
+                    "attachment_id": attachment.attachment_id,
+                    "parent_record_uid": (
+                        attachment.parent_record_uid
+                    ),
+                    "report_id": raw_report.get(
+                        "report_id"
+                    ),
+                    "category": (
+                        raw_report.get(
+                            "category"
+                        )
+                        or raw_report.get(
+                            "report_type"
+                        )
+                    ),
+                    "source_url": attachment.source_url,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "sha256": attachment.sha256,
+                    "file_size": attachment.file_size,
+                    "local_path": str(
+                        attachment.local_path
+                    ),
+                    "remote_path": (
+                        result.upload_result.remote_path
+                    ),
+                    "upload_status": (
+                        result.upload_result.status
+                    ),
+                    "page": raw_report.get(
+                        "page",
+                        start_page,
+                    ),
+                }
+
+                processed_attachments += 1
 
             return
 
@@ -945,6 +1876,42 @@ class NaverFinancePlugin(
 
             return (
                 self._normalize_news_article(
+                    raw,
+                    scope,
+                )
+            )
+
+        if dataset == "news_instrument":
+
+            return (
+                self._normalize_news_instrument(
+                    raw,
+                    scope,
+                )
+            )
+
+        if dataset == "research_report":
+
+            return (
+                self._normalize_research_report(
+                    raw,
+                    scope,
+                )
+            )
+
+        if dataset == "research_instrument":
+
+            return (
+                self._normalize_research_instrument(
+                    raw,
+                    scope,
+                )
+            )
+
+        if dataset == "attachment":
+
+            return (
+                self._normalize_attachment(
                     raw,
                     scope,
                 )
@@ -1002,10 +1969,8 @@ class NaverFinancePlugin(
             scope
         )
 
-        instrument_id = (
-            self._instrument_id(
-                code
-            )
+        instrument_id = self._instrument_id(
+            code
         )
 
         # ====================================================
@@ -1166,6 +2131,10 @@ class NaverFinancePlugin(
             scope
         )
 
+        instrument_id = self._instrument_id(
+            code
+        )
+
         source_id = (
             f"{office_id}:{article_id}"
             if office_id
@@ -1188,24 +2157,40 @@ class NaverFinancePlugin(
             country=self.country,
             dataset="news_article",
             source_id=source_id,
-            scope_type=(
-                scope.scope_type
-            ),
-            scope_id=(
-                scope.scope_id
-                or self._instrument_id(
-                    code
-                )
-            ),
-            instrument_id=(
-                self._instrument_id(
-                    code
-                )
-            ),
+            scope_type="global",
+            scope_id=None,
+            instrument_id=None,
             event_time=event_time,
             title=self._optional_text(
                 raw.get(
                     "title"
+                )
+            ),
+            content=self._optional_text(
+                raw.get(
+                    "content"
+                )
+                or raw.get(
+                    "body"
+                )
+            ),
+            author_name=self._optional_text(
+                raw.get(
+                    "author"
+                )
+                or raw.get(
+                    "journalist"
+                )
+            ),
+            source_url=self._optional_text(
+                raw.get(
+                    "canonical_url"
+                )
+                or raw.get(
+                    "canonical"
+                )
+                or raw.get(
+                    "url"
                 )
             ),
             payload={
@@ -1221,12 +2206,8 @@ class NaverFinancePlugin(
                         raw.get(
                             "author"
                         )
-                    )
-                ),
-                "content": (
-                    self._optional_text(
-                        raw.get(
-                            "content"
+                        or raw.get(
+                            "journalist"
                         )
                     )
                 ),
@@ -1242,6 +2223,460 @@ class NaverFinancePlugin(
                         raw.get(
                             "source"
                         )
+                    )
+                ),
+            },
+            relations=[
+                RecordRelation(
+                    instrument_id=instrument_id,
+                    relation_type="primary",
+                    confidence=1.0,
+                )
+            ],
+        )
+
+
+    def _normalize_news_instrument(
+        self,
+        raw: dict[
+            str,
+            Any,
+        ],
+        scope: CrawlScope,
+    ) -> CanonicalRecord:
+
+        article_id = self._required_text(
+            raw,
+            "article_id",
+        )
+
+        office_id = self._optional_text(
+            raw.get(
+                "office_id"
+            )
+        )
+
+        code = self._scope_code(
+            scope
+        )
+
+        instrument_id = self._instrument_id(
+            code
+        )
+
+        article_source_id = (
+            f"{office_id}:{article_id}"
+            if office_id
+            else article_id
+        )
+
+        relation_source_id = (
+            f"{article_source_id}:"
+            f"{instrument_id}"
+        )
+
+        return CanonicalRecord(
+            site_id=self.site_id,
+            country=self.country,
+            dataset="news_instrument",
+            source_id=relation_source_id,
+            scope_type="global",
+            scope_id=None,
+            instrument_id=instrument_id,
+            title=self._optional_text(
+                raw.get(
+                    "title"
+                )
+            ),
+            source_url=self._optional_text(
+                raw.get(
+                    "canonical_url"
+                )
+                or raw.get(
+                    "canonical"
+                )
+                or raw.get(
+                    "url"
+                )
+            ),
+            payload={
+                "article_source_id": (
+                    article_source_id
+                ),
+                "article_id": (
+                    article_id
+                ),
+                "office_id": (
+                    office_id
+                ),
+                "code": code,
+                "instrument_id": (
+                    instrument_id
+                ),
+                "relation_type": "primary",
+            },
+            relations=[
+                RecordRelation(
+                    instrument_id=instrument_id,
+                    relation_type="primary",
+                    confidence=1.0,
+                )
+            ],
+        )
+
+
+    def _normalize_research_report(
+        self,
+        raw: dict[
+            str,
+            Any,
+        ],
+        scope: CrawlScope,
+    ) -> CanonicalRecord:
+
+        report_id = self._required_text(
+            raw,
+            "report_id",
+        )
+
+        raw_instruments = (
+            raw.get(
+                "instrument_ids"
+            )
+            or []
+        )
+
+        relations = [
+            RecordRelation(
+                instrument_id=str(
+                    instrument_id
+                ).strip(),
+                relation_type="related",
+            )
+            for instrument_id in raw_instruments
+            if str(
+                instrument_id
+            ).strip()
+        ]
+
+        instrument_id = (
+            relations[0].instrument_id
+            if len(
+                relations
+            )
+            == 1
+            else None
+        )
+
+        return CanonicalRecord(
+            site_id=self.site_id,
+            country=self.country,
+            dataset="research_report",
+            source_id=report_id,
+            scope_type=(
+                scope.scope_type
+            ),
+            scope_id=(
+                scope.scope_id
+            ),
+            instrument_id=instrument_id,
+            event_time=self._event_time(
+                raw.get(
+                    "published_at"
+                )
+                or raw.get(
+                    "event_time"
+                )
+            ),
+            title=self._optional_text(
+                raw.get(
+                    "title"
+                )
+            ),
+            content=self._optional_text(
+                raw.get(
+                    "summary"
+                )
+                or raw.get(
+                    "abstract"
+                )
+                or raw.get(
+                    "content"
+                )
+            ),
+            author_name=self._optional_text(
+                raw.get(
+                    "analyst"
+                )
+            ),
+            source_url=self._optional_text(
+                raw.get(
+                    "source_url"
+                )
+                or raw.get(
+                    "detail_url"
+                )
+            ),
+            payload={
+                "report_id": report_id,
+                "category": self._optional_text(
+                    raw.get(
+                        "category"
+                    )
+                    or raw.get(
+                        "report_type"
+                    )
+                ),
+                "institution": self._optional_text(
+                    raw.get(
+                        "institution"
+                    )
+                    or raw.get(
+                        "securities_company"
+                    )
+                ),
+                "analyst": self._optional_text(
+                    raw.get(
+                        "analyst"
+                    )
+                ),
+                "pdf_url": self._optional_text(
+                    raw.get(
+                        "pdf_url"
+                    )
+                ),
+                "pdf_filename": self._optional_text(
+                    raw.get(
+                        "pdf_filename"
+                    )
+                ),
+                "summary": self._optional_text(
+                    raw.get(
+                        "summary"
+                    )
+                    or raw.get(
+                        "content"
+                    )
+                ),
+                "abstract": self._optional_text(
+                    raw.get(
+                        "abstract"
+                    )
+                    or raw.get(
+                        "content"
+                    )
+                ),
+                "stock_code": self._optional_text(
+                    raw.get(
+                        "stock_code"
+                    )
+                ),
+                "stock_name": self._optional_text(
+                    raw.get(
+                        "stock_name"
+                    )
+                ),
+                "classification": self._optional_text(
+                    raw.get(
+                        "classification"
+                    )
+                ),
+                "views": raw.get(
+                    "views"
+                ),
+                "investment_opinion": self._optional_text(
+                    raw.get(
+                        "investment_opinion"
+                    )
+                ),
+                "target_price": raw.get(
+                    "target_price"
+                ),
+                "target_price_text": self._optional_text(
+                    raw.get(
+                        "target_price_text"
+                    )
+                ),
+            },
+            relations=relations,
+        )
+
+
+    def _normalize_research_instrument(
+        self,
+        raw: dict[
+            str,
+            Any,
+        ],
+        scope: CrawlScope,
+    ) -> CanonicalRecord:
+
+        report_id = self._required_text(
+            raw,
+            "report_id",
+        )
+
+        instrument_id = self._required_text(
+            raw,
+            "instrument_id",
+        )
+
+        relation_source_id = (
+            f"{report_id}:"
+            f"{instrument_id}"
+        )
+
+        return CanonicalRecord(
+            site_id=self.site_id,
+            country=self.country,
+            dataset="research_instrument",
+            source_id=relation_source_id,
+            scope_type=(
+                scope.scope_type
+            ),
+            scope_id=(
+                scope.scope_id
+            ),
+            instrument_id=instrument_id,
+            event_time=self._event_time(
+                raw.get(
+                    "published_at"
+                )
+                or raw.get(
+                    "event_time"
+                )
+            ),
+            title=self._optional_text(
+                raw.get(
+                    "title"
+                )
+            ),
+            source_url=self._optional_text(
+                raw.get(
+                    "source_url"
+                )
+                or raw.get(
+                    "detail_url"
+                )
+            ),
+            payload={
+                "report_id": report_id,
+                "category": self._optional_text(
+                    raw.get(
+                        "category"
+                    )
+                    or raw.get(
+                        "report_type"
+                    )
+                ),
+                "instrument_id": instrument_id,
+                "stock_code": self._optional_text(
+                    raw.get(
+                        "stock_code"
+                    )
+                ),
+                "stock_name": self._optional_text(
+                    raw.get(
+                        "stock_name"
+                    )
+                ),
+                "relation_type": "related",
+            },
+            relations=[
+                RecordRelation(
+                    instrument_id=instrument_id,
+                    relation_type="related",
+                    confidence=1.0,
+                )
+            ],
+        )
+
+
+    def _normalize_attachment(
+        self,
+        raw: dict[
+            str,
+            Any,
+        ],
+        scope: CrawlScope,
+    ) -> CanonicalRecord:
+
+        attachment_id = (
+            self._required_text(
+                raw,
+                "attachment_id",
+            )
+        )
+
+        return CanonicalRecord(
+            site_id=self.site_id,
+            country=self.country,
+            dataset="attachment",
+            source_id=attachment_id,
+            scope_type=(
+                scope.scope_type
+            ),
+            scope_id=(
+                scope.scope_id
+            ),
+            title=self._optional_text(
+                raw.get(
+                    "filename"
+                )
+            ),
+            source_url=self._optional_text(
+                raw.get(
+                    "source_url"
+                )
+            ),
+            payload={
+                "attachment_id": attachment_id,
+                "parent_record_uid": (
+                    self._required_text(
+                        raw,
+                        "parent_record_uid",
+                    )
+                ),
+                "report_id": self._optional_text(
+                    raw.get(
+                        "report_id"
+                    )
+                ),
+                "category": self._optional_text(
+                    raw.get(
+                        "category"
+                    )
+                ),
+                "filename": self._optional_text(
+                    raw.get(
+                        "filename"
+                    )
+                ),
+                "mime_type": self._optional_text(
+                    raw.get(
+                        "mime_type"
+                    )
+                ),
+                "sha256": self._required_text(
+                    raw,
+                    "sha256",
+                ),
+                "file_size": raw.get(
+                    "file_size"
+                ),
+                "local_path": self._optional_text(
+                    raw.get(
+                        "local_path"
+                    )
+                ),
+                "remote_path": self._optional_text(
+                    raw.get(
+                        "remote_path"
+                    )
+                ),
+                "upload_status": self._optional_text(
+                    raw.get(
+                        "upload_status"
                     )
                 ),
             },

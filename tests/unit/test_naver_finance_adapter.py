@@ -198,6 +198,36 @@ class FakeResearchClient:
         }
 
 
+class RecordingLegacyPlugin:
+
+    def __init__(
+        self,
+    ):
+
+        self.calls = []
+
+
+    def normalize(
+        self,
+        dataset,
+        payload,
+        scope,
+    ):
+
+        self.calls.append(
+            (
+                dataset,
+                payload,
+                scope,
+            )
+        )
+
+        return {
+            "normalized_dataset": dataset,
+            "payload": payload,
+        }
+
+
 def test_naver_adapter_declares_required_discovery_capability():
 
     adapter = NaverFinanceAdapter(
@@ -213,6 +243,7 @@ def test_naver_adapter_declares_required_discovery_capability():
             "news_instrument",
             "research_report",
             "research_instrument",
+            "attachment",
         )
     )
 
@@ -232,6 +263,71 @@ def test_naver_adapter_declares_required_discovery_capability():
         )
         in adapter.capabilities()
     )
+
+    assert (
+        AdapterCapability(
+            dataset="attachment",
+        )
+        in adapter.capabilities()
+    )
+
+
+@pytest.mark.parametrize(
+    "dataset",
+    (
+        "attachment",
+        "forum_post",
+        "news_article",
+        "news_instrument",
+        "research_report",
+        "research_instrument",
+    ),
+)
+def test_naver_adapter_normalization_delegates_to_production_plugin(
+    dataset,
+):
+
+    legacy_plugin = RecordingLegacyPlugin()
+
+    adapter = NaverFinanceAdapter(
+        market_sum_client=FakeMarketSumClient(),
+        legacy_plugin=legacy_plugin,
+    )
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="compat",
+    )
+
+    payload = {
+        "id": "raw-1",
+    }
+
+    normalized = adapter.normalize(
+        dataset,
+        RawFetchResult(
+            task=CrawlTask(
+                task_id="task-1",
+                source_key="raw-1",
+                scope=scope,
+            ),
+            payload=payload,
+        ),
+        scope,
+    )
+
+    assert normalized == {
+        "normalized_dataset": dataset,
+        "payload": payload,
+    }
+
+    assert legacy_plugin.calls == [
+        (
+            dataset,
+            payload,
+            scope,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -358,13 +454,21 @@ async def test_naver_news_adapter_discovers_fetches_and_normalizes():
 
     assert (
         record.instrument_id
+        is None
+    )
+
+    assert (
+        record.scope_type
+        == "global"
+    )
+
+    assert (
+        record.relations[0].instrument_id
         == "XKRX:005930"
     )
 
     assert (
-        record.payload[
-            "content"
-        ]
+        record.content
         == "news body"
     )
 
@@ -589,6 +693,44 @@ def test_naver_research_report_requires_report_id():
             ),
             scope,
         )
+
+
+def test_naver_research_instrument_adapter_normalizes_relation():
+
+    adapter = NaverFinanceAdapter(
+        market_sum_client=FakeMarketSumClient()
+    )
+
+    scope = CrawlScope(
+        scope_type="global",
+        source_key="research",
+    )
+
+    record = adapter.normalize(
+        "research_instrument",
+        RawFetchResult(
+            task=CrawlTask(
+                task_id="research:company-123:XKRX:005930",
+                source_key="company-123",
+                scope=scope,
+            ),
+            payload={
+                "report_id": "company-123",
+                "category": "company",
+                "instrument_id": "XKRX:005930",
+                "stock_code": "005930",
+            },
+        ),
+        scope,
+    )
+
+    assert record.dataset == "research_instrument"
+
+    assert record.source_id == (
+        "company-123:XKRX:005930"
+    )
+
+    assert record.instrument_id == "XKRX:005930"
 
 
 @pytest.mark.asyncio

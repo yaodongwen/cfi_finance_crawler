@@ -115,6 +115,57 @@ class FakeSession:
         return response
 
 
+class FakeRateLimiter:
+
+    def __init__(
+        self,
+    ):
+
+        self.events = []
+
+
+    def before_request(
+        self,
+        endpoint,
+    ):
+
+        self.events.append(
+            (
+                "before",
+                endpoint,
+            )
+        )
+
+
+    def record_failure(
+        self,
+        endpoint,
+        *,
+        throttled=False,
+    ):
+
+        self.events.append(
+            (
+                "failure",
+                endpoint,
+                throttled,
+            )
+        )
+
+
+    def record_success(
+        self,
+        endpoint,
+    ):
+
+        self.events.append(
+            (
+                "success",
+                endpoint,
+            )
+        )
+
+
 # ============================================================
 # strip_html
 # ============================================================
@@ -626,6 +677,41 @@ def test_fetch_detail_retries_transient_timeout():
         )
         == 2
     )
+
+
+def test_get_with_retries_reports_429_to_rate_limiter():
+
+    session = FakeSession(
+        [
+            FakeResponse(
+                status_code=429
+            )
+        ]
+    )
+
+    limiter = FakeRateLimiter()
+
+    client = NaverForumClient(
+        session=session,
+        retry_sleep_seconds=0,
+        rate_limiter=limiter,
+    )
+
+    client._get_with_retries(
+        "https://finance.naver.com/item/board.naver"
+    )
+
+    assert limiter.events == [
+        (
+            "before",
+            "https://finance.naver.com/item/board.naver",
+        ),
+        (
+            "failure",
+            "https://finance.naver.com/item/board.naver",
+            True,
+        ),
+    ]
 
 
 def test_fetch_detail_raises_missing_for_deleted_post():

@@ -471,6 +471,53 @@ def test_mark_failed(
     )
 
 
+def test_reclassify_failed_manifest_is_non_destructive(
+    tmp_path,
+):
+
+    store = RecoveryStore(
+        tmp_path
+        / "recovery"
+    )
+
+    manifest = make_manifest()
+
+    store.save(
+        manifest
+    )
+
+    failed = store.mark_failed(
+        manifest.manifest_id,
+        "remote stat failed: setlocale warning",
+        retryable=False,
+        retry_reason="non_retryable_error",
+    )
+
+    reclassified = store.reclassify_failed(
+        manifest.manifest_id,
+        retryable=True,
+        retry_reason="retryable_error",
+    )
+
+    assert reclassified.stage == "failed"
+    assert (
+        reclassified.failed_from_stage
+        == failed.failed_from_stage
+    )
+    assert (
+        reclassified.retry_count
+        == failed.retry_count
+    )
+    assert (
+        reclassified.retryable
+        is True
+    )
+    assert (
+        reclassified.retry_reason
+        == "retryable_error"
+    )
+
+
 def test_list_pending(
     tmp_path,
 ):
@@ -2380,6 +2427,5 @@ def test_successful_resume_clears_retry_flags(
         loaded.failed_from_stage
         is None
     )
-
 
 

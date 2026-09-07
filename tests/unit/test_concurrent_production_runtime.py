@@ -11,7 +11,12 @@ from typing import Any
 import pytest
 
 from crawl_framework.core.concurrent_runtime import (
+    ConcurrentRuntimeError,
     ConcurrentProductionRuntime,
+    ProgressSnapshot,
+)
+from crawl_framework.core.concurrency import (
+    DatasetResourceBudget,
 )
 from crawl_framework.core.models import (
     CanonicalRecord,
@@ -138,8 +143,23 @@ class FakeBuffer:
             )
         ]
 
+    def has_scope(self, scope_token):
+        suffix = scope_token.rsplit("|", 1)[-1]
+        return any(
+            record.source_id.startswith(suffix)
+            for record in self.records
+        )
+
     def flush_all(self):
-        return []
+        if not self.records:
+            return []
+        batch = FakeBatch(
+            scope_tokens=frozenset(self.scope_tokens),
+            records=tuple(self.records),
+        )
+        self.records = []
+        self.scope_tokens = set()
+        return [batch]
 
 
 class InstrumentedPipeline:
@@ -155,6 +175,7 @@ class InstrumentedPipeline:
         self.upload_delay = upload_delay
         self.catalog_delay = catalog_delay
         self.stage_order: list[str] = []
+        self.fail_upload = False
 
     def submit_for_staged_runtime(self, record, *, scope_token=None):
         self.buffer.add(record, scope_token=scope_token)
@@ -178,6 +199,10 @@ class InstrumentedPipeline:
         self.events.append(
             ("upload_start", _batch_name(prepared.batch), time.monotonic())
         )
+        if self.fail_upload:
+            raise RuntimeError(
+                "upload boom"
+            )
         time.sleep(self.upload_delay)
         self.events.append(
             ("upload_done", _batch_name(prepared.batch), time.monotonic())
@@ -219,8 +244,12 @@ class InstrumentedPipeline:
 
 
 def _batch_name(batch) -> str:
-    token = next(iter(batch.scope_tokens))
-    return token.rsplit("|", 1)[-1]
+    return ",".join(
+        sorted(
+            token.rsplit("|", 1)[-1]
+            for token in batch.scope_tokens
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -248,6 +277,76 @@ async def test_concurrent_runtime_overlaps_crawl_upload_and_catalog(tmp_path):
     assert stats.catalog_jobs_completed == 6
     assert stats.crawl_upload_overlap
     assert stats.upload_catalog_overlap
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_uses_dataset_crawl_worker_budget(tmp_path):
+    events: list[tuple[str, str, float]] = []
+    runtime = ConcurrentProductionRuntime(
+        plugin=InstrumentedPlugin(events),
+        pipeline=InstrumentedPipeline(events),
+        checkpoint_store=FileCheckpointStore(tmp_path / "checkpoints"),
+        context=CrawlContext(
+            extra={
+                "dataset_budgets": {
+                    "forum_post": DatasetResourceBudget(
+                        crawl_workers=3,
+                    ),
+                },
+            },
+        ),
+        crawl_workers=1,
+        writer_workers=1,
+        upload_workers=1,
+        catalog_workers=1,
+        record_queue_size=10,
+        upload_queue_size=10,
+        catalog_queue_size=10,
+    )
+
+    result = await runtime.run(
+        datasets=(
+            "forum_post",
+        )
+    )
+
+    assert result[
+        "production_stats"
+    ].crawl_workers == 3
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_reports_live_progress(tmp_path):
+    events: list[tuple[str, str, float]] = []
+    snapshots: list[ProgressSnapshot] = []
+    runtime = ConcurrentProductionRuntime(
+        plugin=InstrumentedPlugin(events),
+        pipeline=InstrumentedPipeline(events, upload_delay=0.02),
+        checkpoint_store=FileCheckpointStore(tmp_path / "checkpoints"),
+        context=CrawlContext(),
+        crawl_workers=2,
+        writer_workers=1,
+        upload_workers=1,
+        catalog_workers=1,
+        record_queue_size=10,
+        upload_queue_size=10,
+        catalog_queue_size=10,
+        progress_reporter=snapshots.append,
+        progress_interval_seconds=0.01,
+    )
+
+    await runtime.run(
+        datasets=(
+            "forum_post",
+        )
+    )
+
+    assert snapshots
+    assert snapshots[0].dataset == "forum_post"
+    assert isinstance(
+        snapshots[0].record_queue_depth,
+        int,
+    )
 
 
 @pytest.mark.asyncio
@@ -308,3 +407,147 @@ async def test_concurrent_runtime_preserves_batch_durable_order(tmp_path):
         assert observed.index("write") < observed.index("upload_start")
         assert observed.index("upload_done") < observed.index("catalog_start")
         assert observed.index("catalog_start") < observed.index("catalog_done")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_can_coalesce_scope_flushes_without_early_checkpoint(
+    tmp_path,
+):
+    events: list[tuple[str, str, float]] = []
+    pipeline = InstrumentedPipeline(events, upload_delay=0.0, catalog_delay=0.0)
+    checkpoint_store = FileCheckpointStore(
+        tmp_path / "checkpoints"
+    )
+    runtime = ConcurrentProductionRuntime(
+        plugin=InstrumentedPlugin(events),
+        pipeline=pipeline,
+        checkpoint_store=checkpoint_store,
+        context=CrawlContext(),
+        crawl_workers=2,
+        writer_workers=1,
+        upload_workers=1,
+        catalog_workers=1,
+        record_queue_size=20,
+        upload_queue_size=20,
+        catalog_queue_size=20,
+        flush_scope_on_scope_done=False,
+    )
+
+    result = await runtime.run(
+        datasets=("forum_post",)
+    )
+
+    names = [
+        name
+        for event, name, _ in events
+        if event == "write"
+    ]
+    assert names == [
+        "000001,000002,000003,000004,000005,000006"
+    ]
+    assert runtime.production_stats.files_written == 1
+    assert runtime.production_stats.uploads_completed == 1
+    assert runtime.production_stats.catalog_jobs_completed == 1
+    assert len(result["runtime"]) == 6
+    assert runtime.stats.checkpoints_saved == 6
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_runs_post_dataset_hook_after_drain(
+    tmp_path,
+):
+
+    events: list[tuple[str, str, float]] = []
+    hook_calls = []
+
+    def post_dataset_hook(dataset):
+
+        hook_calls.append(
+            (
+                dataset,
+                list(events),
+            )
+        )
+
+        return {
+            "dataset": dataset,
+            "replacement_files": 1,
+        }
+
+    runtime = ConcurrentProductionRuntime(
+        plugin=InstrumentedPlugin(events),
+        pipeline=InstrumentedPipeline(events, upload_delay=0.0, catalog_delay=0.0),
+        checkpoint_store=FileCheckpointStore(tmp_path / "checkpoints"),
+        context=CrawlContext(),
+        crawl_workers=2,
+        writer_workers=1,
+        upload_workers=1,
+        catalog_workers=1,
+        record_queue_size=20,
+        upload_queue_size=20,
+        catalog_queue_size=20,
+        flush_scope_on_scope_done=False,
+        post_dataset_hook=post_dataset_hook,
+    )
+
+    result = await runtime.run(
+        datasets=("forum_post",)
+    )
+
+    assert hook_calls
+    assert hook_calls[0][0] == "forum_post"
+
+    observed = [
+        event
+        for event, _, _ in hook_calls[0][1]
+    ]
+
+    assert (
+        "catalog_done"
+        in observed
+    )
+
+    assert result["post_dataset"] == [
+        {
+            "dataset": "forum_post",
+            "replacement_files": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_collects_worker_failure_and_cancels_siblings(
+    tmp_path,
+):
+    events: list[tuple[str, str, float]] = []
+    pipeline = InstrumentedPipeline(events)
+    pipeline.fail_upload = True
+    runtime = ConcurrentProductionRuntime(
+        plugin=InstrumentedPlugin(events),
+        pipeline=pipeline,
+        checkpoint_store=FileCheckpointStore(tmp_path / "checkpoints"),
+        context=CrawlContext(),
+        crawl_workers=2,
+        writer_workers=1,
+        upload_workers=2,
+        catalog_workers=2,
+        record_queue_size=2,
+        upload_queue_size=2,
+        catalog_queue_size=2,
+    )
+
+    with pytest.raises(
+        ConcurrentRuntimeError,
+        match="upload boom",
+    ):
+
+        await runtime.run(
+            datasets=(
+                "forum_post",
+            )
+        )
+
+    assert (
+        runtime.stats.errors
+        == 1
+    )

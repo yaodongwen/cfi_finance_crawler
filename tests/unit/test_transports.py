@@ -10,6 +10,10 @@ from crawl_framework.transports.proxy import (
     ProxyPool,
     ProxyPoolConfig,
 )
+from crawl_framework.transports.rate_limit import (
+    AdaptiveRateLimitConfig,
+    AdaptiveRateLimiter,
+)
 
 
 def test_proxy_pool_round_robin_selects_available_proxies():
@@ -202,3 +206,133 @@ async def test_http_transport_reports_proxy_failure():
         pool.states[0].failures
         == 1
     )
+
+
+def test_adaptive_rate_limiter_tracks_throttle_and_circuit():
+
+    now = [
+        100.0,
+    ]
+
+    sleeps = []
+
+    limiter = AdaptiveRateLimiter(
+        AdaptiveRateLimitConfig(
+            throttle_delay_seconds=2,
+            max_delay_seconds=10,
+            failure_threshold=2,
+        ),
+        sleep=sleeps.append,
+        monotonic=lambda: now[0],
+    )
+
+    limiter.record_failure(
+        "https://example.com/a",
+        throttled=True,
+    )
+    limiter.record_failure(
+        "https://example.com/a",
+        throttled=True,
+    )
+    limiter.before_request(
+        "https://example.com/a"
+    )
+
+    state = limiter.state_for(
+        "https://example.com/a"
+    )
+
+    assert state.throttles == 2
+    assert state.consecutive_failures == 2
+    assert sleeps[0] == 4
+
+    limiter.record_success(
+        "https://example.com/a"
+    )
+
+    assert state.consecutive_failures == 0
+    assert state.current_delay_seconds == 0
+    assert state.circuit_open_until is None
+
+
+@pytest.mark.asyncio
+async def test_http_transport_reports_rate_limiter_status():
+
+    class Response:
+        status_code = 429
+
+    events = []
+
+    class Limiter:
+
+        def before_request(
+            self,
+            endpoint,
+        ):
+
+            events.append(
+                (
+                    "before",
+                    endpoint,
+                )
+            )
+
+
+        def record_failure(
+            self,
+            endpoint,
+            *,
+            throttled=False,
+        ):
+
+            events.append(
+                (
+                    "failure",
+                    endpoint,
+                    throttled,
+                )
+            )
+
+
+        def record_success(
+            self,
+            endpoint,
+        ):
+
+            events.append(
+                (
+                    "success",
+                    endpoint,
+                )
+            )
+
+    async def requester(
+        url,
+        kwargs,
+    ):
+
+        del kwargs
+        return Response()
+
+    transport = HttpTransport(
+        requester=requester,
+        rate_limiter=Limiter(),
+    )
+
+    await transport.request(
+        HttpRequest(
+            url="https://example.com/throttle"
+        )
+    )
+
+    assert events == [
+        (
+            "before",
+            "https://example.com/throttle",
+        ),
+        (
+            "failure",
+            "https://example.com/throttle",
+            True,
+        ),
+    ]

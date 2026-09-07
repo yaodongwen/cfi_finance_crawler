@@ -12,6 +12,7 @@ from crawl_framework.app_factory import (
     PostgresNotConfiguredError,
     SiteFactoryRegistry,
     UnknownSiteError,
+    format_progress_snapshot,
     make_crawl_context,
     make_config_uploader_factory,
     _use_concurrent_production_runtime,
@@ -21,16 +22,22 @@ from crawl_framework.cli.main import (
     CLIOptions,
 )
 
+from crawl_framework.config import (
+    load_config,
+)
+
 from crawl_framework.core.models import (
     CanonicalRecord,
 )
 
 from crawl_framework.core.concurrency import (
+    DatasetResourceBudget,
     StageConcurrencyConfig,
 )
 
 from crawl_framework.core.concurrent_runtime import (
     ConcurrentProductionRuntime,
+    ProgressSnapshot,
 )
 
 from crawl_framework.core.plugin import (
@@ -267,6 +274,17 @@ class DemoPlugin(
         return CrawlCheckpoint(
             state=state
         )
+
+
+class AttachmentDemoPlugin(
+    DemoPlugin
+):
+
+    def __init__(
+        self,
+    ):
+
+        self.attachment_pipeline = None
         
 # ============================================================
 # Helpers
@@ -276,14 +294,23 @@ class DemoPlugin(
 def options(
     *,
     site="demo",
+    **overrides,
 ):
 
+    values = {
+        "site": site,
+        "datasets": None,
+        "flush_at_end": True,
+        "json_output": False,
+        "recovery_only": False,
+    }
+
+    values.update(
+        overrides
+    )
+
     return CLIOptions(
-        site=site,
-        datasets=None,
-        flush_at_end=True,
-        json_output=False,
-        recovery_only=False,
+        **values,
     )
 
 
@@ -556,6 +583,165 @@ def test_app_factory_wires_concurrent_runtime_when_workers_configured(
     )
 
 
+def test_app_factory_maps_pdf_workers_to_attachment_workers(
+    tmp_path,
+):
+
+    registry = SiteFactoryRegistry()
+
+    registry.register(
+        "demo",
+        DemoPlugin,
+    )
+
+    factory = AppFactory(
+        config=AppConfig(
+            paths=(
+                AppPaths.from_root(
+                    tmp_path
+                )
+            ),
+            buffer_min_rows=1,
+            buffer_max_rows=10,
+        ),
+        site_registry=registry,
+        connection_factory=(
+            FakeConnection
+        ),
+    )
+
+    bootstrap = factory.build(
+        options(
+            pdf_workers=4
+        )
+    )
+
+    assert isinstance(
+        bootstrap.runtime,
+        ConcurrentProductionRuntime,
+    )
+
+
+def test_app_factory_wires_progress_reporter_for_text_output(
+    tmp_path,
+):
+
+    registry = SiteFactoryRegistry()
+
+    registry.register(
+        "demo",
+        DemoPlugin,
+    )
+
+    factory = AppFactory(
+        config=AppConfig(
+            paths=(
+                AppPaths.from_root(
+                    tmp_path
+                )
+            ),
+            buffer_min_rows=1,
+            buffer_max_rows=10,
+            stage_concurrency=StageConcurrencyConfig(
+                crawl_workers=2,
+            ),
+        ),
+        site_registry=registry,
+        connection_factory=FakeConnection,
+    )
+
+    bootstrap = factory.build(
+        options(
+            progress_interval_seconds=1.0,
+            json_output=False,
+        )
+    )
+
+    assert isinstance(
+        bootstrap.runtime,
+        ConcurrentProductionRuntime,
+    )
+
+    assert (
+        bootstrap.runtime.progress_reporter
+        is not None
+    )
+
+
+def test_app_factory_disables_progress_reporter_for_json_output(
+    tmp_path,
+):
+
+    registry = SiteFactoryRegistry()
+
+    registry.register(
+        "demo",
+        DemoPlugin,
+    )
+
+    factory = AppFactory(
+        config=AppConfig(
+            paths=(
+                AppPaths.from_root(
+                    tmp_path
+                )
+            ),
+            buffer_min_rows=1,
+            buffer_max_rows=10,
+            stage_concurrency=StageConcurrencyConfig(
+                crawl_workers=2,
+            ),
+        ),
+        site_registry=registry,
+        connection_factory=FakeConnection,
+    )
+
+    bootstrap = factory.build(
+        options(
+            progress_interval_seconds=1.0,
+            json_output=True,
+        )
+    )
+
+    assert isinstance(
+        bootstrap.runtime,
+        ConcurrentProductionRuntime,
+    )
+
+    assert (
+        bootstrap.runtime.progress_reporter
+        is None
+    )
+
+
+def test_format_progress_snapshot():
+
+    text = format_progress_snapshot(
+        ProgressSnapshot(
+            dataset="forum_post",
+            scopes_discovered=10,
+            scopes_started=6,
+            scopes_finished=4,
+            records_crawled=100,
+            files_written=3,
+            uploads_completed=2,
+            catalog_jobs_completed=1,
+            record_queue_depth=5,
+            upload_queue_depth=1,
+            catalog_queue_depth=0,
+            pending_scopes=2,
+            crawl_busy_time=1.25,
+            upload_busy_time=0.5,
+            catalog_busy_time=0.25,
+        )
+    )
+
+    assert "dataset=forum_post" in text
+    assert "scopes=4/10" in text
+    assert "records=100" in text
+    assert "queues=record:5,upload:1,catalog:0" in text
+
+
 def test_runtime_selector_keeps_legacy_single_worker_path():
 
     assert (
@@ -569,6 +755,15 @@ def test_runtime_selector_keeps_legacy_single_worker_path():
         _use_concurrent_production_runtime(
             StageConcurrencyConfig(
                 upload_workers=2
+            )
+        )
+        is True
+    )
+
+    assert (
+        _use_concurrent_production_runtime(
+            StageConcurrencyConfig(
+                attachment_workers=2
             )
         )
         is True
@@ -746,6 +941,46 @@ def test_app_factory_initializes_postgres_schema(
     )
 
 
+def test_app_factory_injects_attachment_pipeline(
+    tmp_path,
+):
+
+    plugin = AttachmentDemoPlugin()
+
+    registry = SiteFactoryRegistry()
+
+    registry.register(
+        "demo",
+        lambda: plugin,
+    )
+
+    factory = AppFactory(
+        config=AppConfig(
+            paths=AppPaths.from_root(
+                tmp_path
+            ),
+        ),
+        site_registry=registry,
+        connection_factory=lambda: FakeConnection(),
+    )
+
+    factory.build(
+        options()
+    )
+
+    assert plugin.attachment_pipeline is not None
+
+    assert (
+        plugin
+        .attachment_pipeline
+        .store
+        .root
+        ==
+        tmp_path
+        / "warehouse"
+    )
+
+
 def test_config_uploader_factory_uses_rsync(
     tmp_path,
 ):
@@ -818,6 +1053,175 @@ sync:
     assert isinstance(
         uploader,
         RsyncUploader,
+    )
+
+
+def test_config_uploader_factory_passes_ssh_multiplex_options(
+    tmp_path,
+):
+
+    config_path = (
+        tmp_path
+        / "config"
+        / "config.yaml"
+    )
+
+    config_path.parent.mkdir()
+
+    config_path.write_text(
+        """
+local:
+  output_dir: "./outputs"
+  warehouse_dir: "./warehouse"
+  index_cache_dir: "./index"
+
+server:
+  host: "192.168.1.33"
+  user: "dwyao"
+  data_dir: "/mnt/data/stocklake"
+
+postgres:
+  host: "192.168.1.33"
+  port: 5432
+  database: "stock_data"
+  user: "stock"
+
+storage:
+  local_warehouse: "./warehouse"
+  server_warehouse: "/mnt/data/stocklake"
+
+sync:
+  delete_after_upload: true
+  method: auto
+  rsync:
+    enabled: true
+    ssh_port: 22
+    ssh_multiplex: true
+    ssh_control_path: "/tmp/crawl-fw-%r@%h:%p"
+    ssh_control_persist: "5m"
+""",
+        encoding="utf-8",
+    )
+
+    framework_config = (
+        load_config(
+            config_path
+        )
+    )
+
+    factory = (
+        make_config_uploader_factory(
+            framework_config
+        )
+    )
+
+    uploader = factory(
+        AppConfig(
+            paths=(
+                AppPaths.from_root(
+                    tmp_path
+                )
+            )
+        )
+    )
+
+    assert isinstance(
+        uploader,
+        RsyncUploader,
+    )
+
+    assert (
+        uploader.ssh_multiplex
+        is True
+    )
+
+    assert (
+        uploader.ssh_control_path
+        == "/tmp/crawl-fw-%r@%h:%p"
+    )
+
+    assert (
+        uploader.ssh_control_persist
+        == "5m"
+    )
+
+
+def test_config_uploader_factory_cli_ssh_multiplex_override(
+    tmp_path,
+):
+
+    config_path = (
+        tmp_path
+        / "config"
+        / "config.yaml"
+    )
+
+    config_path.parent.mkdir()
+
+    config_path.write_text(
+        """
+local:
+  output_dir: "./outputs"
+  warehouse_dir: "./warehouse"
+  index_cache_dir: "./index"
+
+server:
+  host: "192.168.1.33"
+  user: "dwyao"
+  data_dir: "/mnt/data/stocklake"
+
+postgres:
+  host: "192.168.1.33"
+  port: 5432
+  database: "stock_data"
+  user: "stock"
+
+storage:
+  local_warehouse: "./warehouse"
+  server_warehouse: "/mnt/data/stocklake"
+
+sync:
+  delete_after_upload: true
+  method: auto
+  rsync:
+    enabled: true
+    ssh_port: 22
+    ssh_multiplex: false
+""",
+        encoding="utf-8",
+    )
+
+    framework_config = (
+        load_config(
+            config_path
+        )
+    )
+
+    factory = (
+        make_config_uploader_factory(
+            framework_config,
+            ssh_multiplex=True,
+        )
+    )
+
+    uploader = factory(
+        AppConfig(
+            paths=(
+                AppPaths.from_root(
+                    tmp_path
+                )
+            )
+        )
+    )
+
+    assert isinstance(
+        uploader,
+        RsyncUploader,
+    )
+
+    assert (
+        uploader.ssh_multiplex
+        is True
     )
 
 
@@ -974,6 +1378,223 @@ def test_make_crawl_context_passes_max_pages():
         ]
         == 3
     )
+
+    assert (
+        context.extra[
+            "news_max_pages"
+        ]
+        == 3
+    )
+
+    assert (
+        context.extra[
+            "research_max_pages"
+        ]
+        == 3
+    )
+
+
+def test_make_crawl_context_dataset_specific_options_override_max_pages():
+
+    options = CLIOptions(
+        site="naver_finance",
+        datasets=(
+            "news_article",
+            "research_report",
+        ),
+        flush_at_end=True,
+        json_output=False,
+        recovery_only=False,
+        max_pages=9,
+        forum_max_pages=2,
+        news_max_pages=3,
+        research_max_pages=4,
+        news_mode="full",
+        research_mode="incremental",
+        download_research_pdf=False,
+        research_detail_workers=5,
+        pdf_workers=6,
+        forum_crawl_workers=7,
+        news_crawl_workers=8,
+        research_crawl_workers=9,
+        forum_http_concurrency=10,
+        news_http_concurrency=11,
+        research_http_concurrency=12,
+    )
+
+    context = make_crawl_context(
+        options
+    )
+
+    assert context.extra[
+        "forum_max_pages"
+    ] == 2
+
+    assert context.extra[
+        "news_max_pages"
+    ] == 3
+
+    assert context.extra[
+        "research_max_pages"
+    ] == 4
+
+    assert context.extra[
+        "news_mode"
+    ] == "full"
+
+    assert context.extra[
+        "research_mode"
+    ] == "incremental"
+
+    assert context.extra[
+        "download_research_pdf"
+    ] is False
+
+    assert context.extra[
+        "research_detail_workers"
+    ] == 5
+
+    assert context.extra[
+        "pdf_workers"
+    ] == 6
+
+    budgets = context.extra[
+        "dataset_budgets"
+    ]
+
+    assert budgets[
+        "forum_post"
+    ] == DatasetResourceBudget(
+        crawl_workers=7,
+        http_concurrency=10,
+    )
+
+    assert budgets[
+        "news_article"
+    ] == DatasetResourceBudget(
+        crawl_workers=8,
+        http_concurrency=11,
+    )
+
+    assert budgets[
+        "research_report"
+    ] == DatasetResourceBudget(
+        crawl_workers=9,
+        http_concurrency=12,
+        detail_workers=5,
+    )
+
+    assert budgets[
+        "attachment"
+    ] == DatasetResourceBudget(
+        crawl_workers=9,
+        http_concurrency=12,
+        detail_workers=5,
+        attachment_workers=6,
+    )
+
+
+def test_make_crawl_context_naver_full_profile_uses_bounded_forum_pages():
+
+    options = CLIOptions(
+        site="naver_finance",
+        datasets=None,
+        flush_at_end=True,
+        json_output=False,
+        recovery_only=False,
+        profile="naver_full",
+    )
+
+    context = make_crawl_context(
+        options
+    )
+
+    assert "forum_max_pages" not in context.extra
+
+    assert "news_max_pages" not in context.extra
+
+    assert "research_max_pages" not in context.extra
+
+
+def test_make_crawl_context_naver_full_profile_respects_page_overrides():
+
+    options = CLIOptions(
+        site="naver_finance",
+        datasets=None,
+        flush_at_end=True,
+        json_output=False,
+        recovery_only=False,
+        profile="naver_full",
+        news_max_pages=2,
+    )
+
+    context = make_crawl_context(
+        options
+    )
+
+    assert "forum_max_pages" not in context.extra
+
+    assert context.extra[
+        "news_max_pages"
+    ] == 2
+
+
+def test_make_crawl_context_passes_research_categories():
+
+    from crawl_framework.app_factory import (
+        make_crawl_context,
+    )
+
+    from crawl_framework.cli.main import (
+        CLIOptions,
+    )
+
+    options = CLIOptions(
+        site="naver_finance",
+        datasets=(
+            "research_report",
+        ),
+        flush_at_end=True,
+        json_output=False,
+        recovery_only=False,
+        research_categories=(
+            "market",
+            "company",
+        ),
+    )
+
+    context = make_crawl_context(
+        options
+    )
+
+    assert context.extra[
+        "research_categories"
+    ] == (
+        "market",
+        "company",
+    )
+
+
+def test_make_crawl_context_passes_attachment_limit():
+
+    options = CLIOptions(
+        site="naver_finance",
+        datasets=(
+            "attachment",
+        ),
+        flush_at_end=True,
+        json_output=False,
+        recovery_only=False,
+        attachment_limit=1,
+    )
+
+    context = make_crawl_context(
+        options
+    )
+
+    assert context.extra[
+        "attachment_limit"
+    ] == 1
 
 def test_make_crawl_context_omits_max_pages_when_none():
 

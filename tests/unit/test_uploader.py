@@ -2,6 +2,9 @@ from datetime import (
     datetime,
     timezone,
 )
+import subprocess
+
+import pytest
 
 from crawl_framework.core.models import (
     CanonicalRecord,
@@ -16,6 +19,7 @@ from crawl_framework.storage.partition import (
     Partitioner,
 )
 from crawl_framework.storage.uploader import (
+    UploadError,
     LocalUploader,
     RsyncUploader,
 )
@@ -333,6 +337,85 @@ def test_rsync_command(
     )
 
 
+def test_rsync_ssh_multiplex_options_are_reused_by_commands(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="example.com",
+        remote_user="stock",
+        remote_root="/data",
+        ssh_port=2222,
+        dry_run=True,
+        ssh_multiplex=True,
+        ssh_control_path=(
+            "/tmp/crawl-fw-%r@%h:%p"
+        ),
+        ssh_control_persist="5m",
+    )
+
+    rsync_command = (
+        uploader.build_rsync_command(
+            info
+        )
+    )
+
+    mkdir_command = (
+        uploader.build_mkdir_command(
+            info
+        )
+    )
+
+    rsync_text = " ".join(
+        rsync_command
+    )
+
+    mkdir_text = " ".join(
+        mkdir_command
+    )
+
+    for text in (
+        rsync_text,
+        mkdir_text,
+    ):
+
+        assert (
+            "ControlMaster=auto"
+            in text
+        )
+
+        assert (
+            "ControlPersist=5m"
+            in text
+        )
+
+        assert (
+            "ControlPath=/tmp/crawl-fw-%r@%h:%p"
+            in text
+        )
+
+
+def test_rsync_ssh_multiplex_default_control_path_is_short():
+
+    uploader = RsyncUploader(
+        remote_host="example.com",
+        remote_user="stock",
+        remote_root="/data",
+        ssh_multiplex=True,
+    )
+
+    options = uploader.ssh_options()
+
+    assert (
+        "ControlPath=/tmp/cfw-%C"
+        in options
+    )
+
+
 def test_rsync_dry_run_does_not_execute(
     tmp_path,
 ):
@@ -400,4 +483,386 @@ def test_rsync_directory(
 
     assert not remote_dir.endswith(
         ".parquet"
+    )
+
+
+class FakeCompletedProcess:
+
+    def __init__(
+        self,
+        *,
+        returncode=0,
+        stdout="",
+        stderr="",
+    ):
+
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_rsync_mkdir_allows_locale_warning_when_command_succeeds(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        verify_size=False,
+        verify_sha256=False,
+    )
+
+    calls = []
+
+    def fake_run(command):
+
+        calls.append(
+            command
+        )
+
+        if command[0] == "ssh":
+
+            return FakeCompletedProcess(
+                returncode=0,
+                stderr=(
+                    "bash: warning: setlocale: "
+                    "LC_ALL: cannot change locale "
+                    "(C.UTF-8)\n"
+                ),
+            )
+
+        return FakeCompletedProcess(
+            returncode=0,
+            stdout="uploaded",
+        )
+
+    uploader._run = fake_run
+
+    result = uploader.upload(
+        info
+    )
+
+    assert (
+        result.status
+        == "uploaded"
+    )
+
+    assert (
+        len(
+            calls
+        )
+        == 2
+    )
+
+
+def test_rsync_mkdir_still_fails_on_nonzero_exit_with_locale_warning(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+    )
+
+    def fake_run(command):
+
+        del command
+
+        return FakeCompletedProcess(
+            returncode=1,
+            stderr=(
+                "bash: warning: setlocale: "
+                "LC_ALL: cannot change locale "
+                "(C.UTF-8)\npermission denied"
+            ),
+        )
+
+    uploader._run = fake_run
+
+    with pytest.raises(
+        UploadError,
+        match="permission denied",
+    ):
+
+        uploader.upload(
+            info
+        )
+
+
+def test_rsync_remote_stat_ignores_locale_warning_on_success(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        verify_size=True,
+        verify_sha256=False,
+    )
+
+    def fake_run(command):
+
+        if command[0] == "ssh" and "stat" in command:
+
+            return FakeCompletedProcess(
+                returncode=0,
+                stdout=str(
+                    info.file_size
+                ),
+                stderr=(
+                    "bash: warning: setlocale: "
+                    "LC_ALL: cannot change locale "
+                    "(C.UTF-8)\n"
+                ),
+            )
+
+        return FakeCompletedProcess(
+            returncode=0,
+        )
+
+    uploader._run = fake_run
+
+    result = uploader.upload(
+        info
+    )
+
+    assert result.status == "verified"
+
+    assert result.verified is True
+
+
+def test_rsync_caches_remote_directory_mkdir(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        verify_size=False,
+        verify_sha256=False,
+    )
+
+    calls = []
+
+    def fake_run(command):
+
+        calls.append(
+            command
+        )
+
+        return FakeCompletedProcess(
+            returncode=0,
+        )
+
+    uploader._run = fake_run
+
+    uploader.upload(
+        info
+    )
+    uploader.upload(
+        info
+    )
+
+    mkdir_calls = [
+        command
+        for command in calls
+        if command[0] == "ssh"
+        and "mkdir" in command
+    ]
+
+    assert len(mkdir_calls) == 1
+
+
+def test_rsync_can_trust_success_without_remote_stat(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        verify_size=False,
+        verify_sha256=False,
+        trust_rsync_success=True,
+    )
+
+    calls = []
+
+    def fake_run(command):
+
+        calls.append(
+            command
+        )
+
+        return FakeCompletedProcess(
+            returncode=0,
+        )
+
+    uploader._run = fake_run
+
+    result = uploader.upload(
+        info
+    )
+
+    assert result.status == "verified"
+    assert result.verified is True
+    assert result.remote_size == info.file_size
+    assert not any(
+        command[0] == "ssh"
+        and "stat" in command
+        for command in calls
+    )
+
+
+def test_rsync_retries_transient_command_failure(
+    monkeypatch,
+):
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        command_attempts=2,
+        retry_sleep_seconds=0,
+    )
+
+    calls = []
+
+    def fake_subprocess_run(command, **kwargs):
+
+        calls.append(
+            (
+                command,
+                kwargs,
+            )
+        )
+
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                command,
+                returncode=255,
+                stderr="connection reset",
+            )
+
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+        )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        fake_subprocess_run,
+    )
+
+    result = uploader._run(
+        [
+            "ssh",
+            "server",
+            "true",
+        ]
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 2
+    assert calls[0][1]["timeout"] == 120.0
+
+
+def test_rsync_mkdir_failure_reports_unknown_error_when_stderr_is_empty(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        command_attempts=1,
+    )
+
+    def fake_run(command):
+
+        del command
+        return FakeCompletedProcess(
+            returncode=1,
+            stderr="",
+        )
+
+    uploader._run = fake_run
+
+    with pytest.raises(
+        UploadError,
+        match="unknown error",
+    ):
+        uploader.upload(
+            info
+        )
+
+
+def test_rsync_failure_cleans_locale_warning_from_message(
+    tmp_path,
+):
+
+    info = make_parquet_info(
+        tmp_path
+    )
+
+    uploader = RsyncUploader(
+        remote_host="server",
+        remote_root="/data",
+        verify_size=False,
+        verify_sha256=False,
+    )
+
+    def fake_run(command):
+
+        if command[0] == "ssh":
+
+            return FakeCompletedProcess(
+                returncode=0,
+            )
+
+        return FakeCompletedProcess(
+            returncode=20,
+            stderr=(
+                "bash: warning: setlocale: "
+                "LC_ALL: cannot change locale "
+                "(C.UTF-8)\n"
+                "rsync error"
+            ),
+        )
+
+    uploader._run = fake_run
+
+    with pytest.raises(
+        UploadError,
+        match="rsync error",
+    ) as exc_info:
+
+        uploader.upload(
+            info
+        )
+
+    assert "setlocale" not in str(
+        exc_info.value
     )

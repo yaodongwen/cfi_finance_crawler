@@ -53,6 +53,7 @@ spool/*
 
 warehouse/*
 !warehouse/.gitkeep
+web/
 
 logs/*
 !logs/.gitkeep

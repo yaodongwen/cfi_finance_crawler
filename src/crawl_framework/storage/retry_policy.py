@@ -62,6 +62,8 @@ RETRYABLE_KEYWORDS: tuple[str, ...] = (
     "rsync failed",
     "ssh failed",
     "remote unavailable",
+    "setlocale: lc_all: cannot change locale",
+    "cannot change locale",
 
     # ========================================================
     # Database
