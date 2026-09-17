@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import sys
 
+from datetime import datetime, timedelta
 from dataclasses import (
     dataclass,
     field,
 )
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import (
     Callable,
     Protocol,
@@ -41,6 +43,14 @@ from crawl_framework.core.plugin import (
 from crawl_framework.core.runtime import (
     CrawlRuntime,
 )
+from crawl_framework.core.resume import (
+    CheckpointResumeEvidenceProvider,
+    RecoveryStoreResumeInspector,
+    ResumePlanner,
+)
+from crawl_framework.core.shutdown import ShutdownController
+from crawl_framework.observability.progress import ProgressAggregator
+from crawl_framework.observability.renderers import create_progress_renderer
 
 from crawl_framework.storage.buffer import (
     BufferConfig,
@@ -90,6 +100,8 @@ from crawl_framework.storage.record_index import (
     RecordIndexStore,
 )
 
+from crawl_framework.storage.query import CatalogFileResolver
+
 from crawl_framework.storage.retry_policy import (
     RetryPolicy,
 )
@@ -102,6 +114,17 @@ from crawl_framework.storage.uploader import (
     RsyncUploader,
     BaseUploader,
     LocalUploader,
+)
+from crawl_framework.transports.playwright import BrowserWorkerPool, PlaywrightTransportConfig
+from crawl_framework.transports.proxy import ProxyPool, ProxyPoolConfig
+from crawl_framework.transports.http import (
+    HttpRetryConfig,
+    HttpTransport,
+    RequestsHttpRequester,
+)
+from crawl_framework.transports.rate_limit import (
+    AdaptiveRateLimitConfig,
+    AdaptiveRateLimiter,
 )
 
 
@@ -247,6 +270,14 @@ def make_crawl_context(
             options.news_mode
         )
 
+    if options.forum_mode is not None:
+
+        extra[
+            "forum_mode"
+        ] = str(
+            options.forum_mode
+        )
+
     if options.research_mode is not None:
 
         extra[
@@ -378,6 +409,51 @@ def make_crawl_context(
         ] = int(
             options.attachment_limit
         )
+
+    if options.profile in {
+        "kabutan_incremental",
+        "kabutan_free_full",
+        "kabutan_full",
+    }:
+        extra["kabutan_mode"] = (
+            "free_full"
+            if options.profile in {"kabutan_free_full", "kabutan_full"}
+            else "incremental"
+        )
+
+    for option_name in (
+        "kabutan_start_month",
+        "kabutan_end_month",
+        "kabutan_overlap_months",
+        "kabutan_max_pages_per_month",
+    ):
+        value = getattr(options, option_name, None)
+        if value is not None:
+            extra[option_name] = value
+
+    if options.profile in {"hkex_reports_incremental", "hkex_reports_full"}:
+        extra["hkex_report_mode"] = (
+            "incremental"
+            if options.profile == "hkex_reports_incremental"
+            else "full"
+        )
+    if options.report_types is not None:
+        extra["hkex_report_types"] = tuple(options.report_types)
+    report_date_from = options.report_date_from
+    report_date_to = options.report_date_to
+    if options.profile == "hkex_reports_incremental":
+        today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+        if report_date_to is None:
+            report_date_to = today.strftime("%Y%m%d")
+        if report_date_from is None:
+            lookback = options.report_lookback_days or 400
+            report_date_from = (today - timedelta(days=lookback)).strftime("%Y%m%d")
+    if report_date_from is not None:
+        extra["hkex_report_date_from"] = report_date_from
+    if report_date_to is not None:
+        extra["hkex_report_date_to"] = report_date_to
+    if options.download_report_pdf is not None:
+        extra["download_report_pdf"] = options.download_report_pdf
 
     return CrawlContext(
         extra=extra
@@ -578,6 +654,18 @@ class AppConfig:
 
     queue_sizes: QueueSizeConfig = field(
         default_factory=QueueSizeConfig
+    )
+
+    browser_config: PlaywrightTransportConfig | None = None
+    browser_proxy_endpoints: tuple[str, ...] = ()
+    browser_proxy_config: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
+
+    http_timeout_seconds: float = 20.0
+    http_retry_config: HttpRetryConfig = field(default_factory=HttpRetryConfig)
+    http_proxy_endpoints: tuple[str, ...] = ()
+    http_proxy_config: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
+    http_rate_limit_config: AdaptiveRateLimitConfig = field(
+        default_factory=AdaptiveRateLimitConfig
     )
 
 
@@ -1123,6 +1211,44 @@ class AppFactory:
             options
         )
 
+        managed_resources = []
+        if getattr(plugin, "requires_browser", False):
+            browser_config = self.config.browser_config or PlaywrightTransportConfig()
+            proxy_pool = ProxyPool(
+                self.config.browser_proxy_endpoints,
+                config=self.config.browser_proxy_config,
+            )
+            crawl_context.browser = BrowserWorkerPool(
+                browser_config,
+                proxy_pool=proxy_pool,
+            )
+            managed_resources.append(crawl_context.browser)
+
+        if getattr(plugin, "requires_http", False):
+            crawl_context.http = HttpTransport(
+                requester=RequestsHttpRequester(
+                    timeout_seconds=self.config.http_timeout_seconds,
+                    pool_size=(
+                        options.news_http_concurrency
+                        or options.http_concurrency
+                        or self.config.stage_concurrency.http_concurrency
+                    ),
+                ),
+                proxy_pool=ProxyPool(
+                    self.config.http_proxy_endpoints,
+                    config=self.config.http_proxy_config,
+                ),
+                rate_limiter=AdaptiveRateLimiter(
+                    self.config.http_rate_limit_config,
+                ),
+                retry_config=self.config.http_retry_config,
+                max_concurrency=(
+                    options.news_http_concurrency
+                    or options.http_concurrency
+                    or self.config.stage_concurrency.http_concurrency
+                ),
+            )
+
         base_concurrency = (
             self.config.stage_concurrency
         )
@@ -1161,7 +1287,8 @@ class AppFactory:
         )
 
         if _use_concurrent_production_runtime(
-            concurrency
+            concurrency,
+            production_profile=options.profile is not None,
         ):
 
             post_dataset_hook = None
@@ -1187,12 +1314,42 @@ class AppFactory:
                             .paths
                             .warehouse
                         ),
+                        source_resolver=CatalogFileResolver(
+                            remote_host=getattr(uploader, "remote_host", None),
+                            remote_user=getattr(uploader, "remote_user", None),
+                            ssh_port=int(getattr(uploader, "ssh_port", 22)),
+                        ),
                         min_file_count=(
                             options.compaction_min_file_count
                             or 2
                         ),
                         dry_run=False,
                     )
+
+            progress_aggregator = ProgressAggregator(
+                profile=options.profile,
+            )
+            progress_enabled = (
+                options.progress_enabled is not False
+                and not options.json_output
+            )
+            progress_renderer = (
+                create_progress_renderer(
+                    style=options.progress_style,
+                    stream=sys.stderr,
+                )
+                if progress_enabled
+                else None
+            )
+            progress_reporter = (
+                (
+                    lambda _snapshot: progress_renderer.render(
+                        progress_aggregator.snapshot()
+                    )
+                )
+                if progress_renderer is not None
+                else None
+            )
 
             runtime = ConcurrentProductionRuntime(
                 plugin=plugin,
@@ -1221,16 +1378,16 @@ class AppFactory:
                     queues.catalog
                 ),
                 progress_reporter=(
-                    print_progress_snapshot
-                    if (
-                        options.progress_interval_seconds
-                        is not None
-                        and not options.json_output
-                    )
-                    else None
+                    progress_reporter
                 ),
                 progress_interval_seconds=(
-                    options.progress_interval_seconds
+                    (
+                        options.progress_interval_seconds
+                        if options.progress_interval_seconds is not None
+                        else 5.0
+                    )
+                    if progress_reporter is not None
+                    else None
                 ),
                 flush_scope_on_scope_done=(
                     not options.coalesce_scope_flushes
@@ -1238,6 +1395,31 @@ class AppFactory:
                 post_dataset_hook=(
                     post_dataset_hook
                 ),
+                resume_planner=ResumePlanner(
+                    evidence_provider=CheckpointResumeEvidenceProvider(
+                        checkpoint_store=checkpoint_store,
+                        is_durable_complete=(
+                            lambda scope, checkpoint: (
+                                plugin.is_checkpoint_durable_complete(
+                                    scope.dataset,
+                                    scope.scope,
+                                    checkpoint,
+                                    crawl_context,
+                                )
+                            )
+                        ),
+                        inspect_recovery=RecoveryStoreResumeInspector(
+                            recovery_store
+                        ),
+                    )
+                ),
+                progress_aggregator=progress_aggregator,
+                progress_finalizer=(
+                    progress_renderer.close
+                    if progress_renderer is not None
+                    else None
+                ),
+                shutdown_controller=ShutdownController(),
             )
 
         else:
@@ -1266,6 +1448,7 @@ class AppFactory:
                     options.datasets
                 ),
             ),
+            managed_resources=tuple(managed_resources),
         )
 
 
@@ -1276,16 +1459,18 @@ class AppFactory:
 
 def _use_concurrent_production_runtime(
     concurrency: StageConcurrencyConfig,
+    *,
+    production_profile: bool = False,
 ) -> bool:
     """
     Production runtime selector.
 
-    Keep the legacy single-worker runtime for single-scope compatibility tests
-    and opt into the bounded staged runner when any production stage is
-    configured for parallel work.
+    Keep the legacy single-worker runtime for unprofiled compatibility calls.
+    Named production profiles always use the bounded durable pipeline, even
+    when every stage is conservatively configured with one worker.
     """
 
-    return any(
+    return production_profile or any(
         worker_count > 1
         for worker_count in (
             concurrency.crawl_workers,
@@ -1682,6 +1867,39 @@ def build_default_bootstrap(
         queue_sizes=(
             framework_config
             .queues
+        ),
+        browser_config=PlaywrightTransportConfig(
+            workers=framework_config.browser.workers,
+            headless=framework_config.browser.headless,
+            locale=framework_config.browser.locale,
+            timezone_id=framework_config.browser.timezone_id,
+            page_timeout_ms=framework_config.browser.page_timeout_ms,
+            navigation_timeout_ms=framework_config.browser.navigation_timeout_ms,
+            profile_root=framework_config.browser.profile_root,
+            recycle_after_scopes=framework_config.browser.recycle_after_scopes,
+            launch_args=("--disable-blink-features=AutomationControlled",),
+            worker_budgets=framework_config.browser.worker_budgets,
+        ),
+        browser_proxy_endpoints=framework_config.browser.proxies,
+        browser_proxy_config=ProxyPoolConfig(
+            strategy=framework_config.browser.proxy_strategy,
+            failure_cooldown_seconds=framework_config.browser.proxy_failure_cooldown_seconds,
+        ),
+        http_timeout_seconds=framework_config.http.timeout_seconds,
+        http_retry_config=HttpRetryConfig(
+            max_attempts=framework_config.http.max_attempts,
+            backoff_seconds=framework_config.http.retry_backoff_seconds,
+        ),
+        http_proxy_endpoints=framework_config.http.proxies,
+        http_proxy_config=ProxyPoolConfig(
+            strategy=framework_config.http.proxy_strategy,
+            failure_cooldown_seconds=framework_config.http.proxy_failure_cooldown_seconds,
+        ),
+        http_rate_limit_config=AdaptiveRateLimitConfig(
+            base_delay_seconds=framework_config.http.base_delay_seconds,
+            throttle_delay_seconds=framework_config.http.throttle_delay_seconds,
+            max_delay_seconds=framework_config.http.max_delay_seconds,
+            failure_threshold=framework_config.http.failure_threshold,
         ),
     )
 

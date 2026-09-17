@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
 
 import pytest
+import asyncio
 
 from crawl_framework.transports.http import (
     HttpRequest,
+    HttpResponse,
+    HttpRetryConfig,
     HttpTransport,
 )
 from crawl_framework.transports.proxy import (
@@ -170,6 +173,27 @@ async def test_http_transport_passes_selected_proxy():
 
 
 @pytest.mark.asyncio
+async def test_http_transport_passes_form_data():
+    calls = []
+
+    async def requester(url, kwargs):
+        calls.append((url, kwargs))
+        return HttpResponse(200, b"ok", url)
+
+    transport = HttpTransport(requester=requester)
+    await transport.request(
+        HttpRequest(
+            "https://example.com/form",
+            method="POST",
+            data={"key": "value"},
+        )
+    )
+
+    assert calls[0][1]["method"] == "POST"
+    assert calls[0][1]["data"] == {"key": "value"}
+
+
+@pytest.mark.asyncio
 async def test_http_transport_reports_proxy_failure():
 
     async def requester(
@@ -244,7 +268,7 @@ def test_adaptive_rate_limiter_tracks_throttle_and_circuit():
 
     assert state.throttles == 2
     assert state.consecutive_failures == 2
-    assert sleeps[0] == 4
+    assert sleeps == [8]
 
     limiter.record_success(
         "https://example.com/a"
@@ -336,3 +360,97 @@ async def test_http_transport_reports_rate_limiter_status():
             True,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_http_transport_awaits_adaptive_delay_without_blocking_sleep():
+    async_sleeps = []
+
+    def blocking_sleep(delay):
+        raise AssertionError(f"synchronous sleep called for {delay}")
+
+    limiter = AdaptiveRateLimiter(
+        AdaptiveRateLimitConfig(
+            base_delay_seconds=0.25,
+        ),
+        sleep=blocking_sleep,
+    )
+
+    async def requester(url, kwargs):
+        del kwargs
+        return HttpResponse(200, b"ok", url)
+
+    async def async_sleep(delay):
+        async_sleeps.append(delay)
+        await asyncio.sleep(0)
+
+    transport = HttpTransport(
+        requester=requester,
+        rate_limiter=limiter,
+        sleep=async_sleep,
+    )
+
+    response = await transport.request(
+        HttpRequest("https://example.com/nonblocking")
+    )
+
+    assert response.status_code == 200
+    assert async_sleeps == [0.25]
+
+
+@pytest.mark.asyncio
+async def test_http_transport_retries_configured_statuses():
+    statuses = [500, 503, 200]
+    sleeps = []
+
+    async def requester(url, kwargs):
+        del url, kwargs
+        return HttpResponse(
+            status_code=statuses.pop(0),
+            content=b"ok",
+            url="https://example.com",
+        )
+
+    transport = HttpTransport(
+        requester=requester,
+        retry_config=HttpRetryConfig(max_attempts=3, backoff_seconds=0.25),
+        sleep=lambda delay: _record_sleep(sleeps, delay),
+    )
+
+    response = await transport.request(HttpRequest("https://example.com"))
+
+    assert response.status_code == 200
+    assert statuses == []
+    assert sleeps == [0.25, 0.5]
+
+
+async def _record_sleep(values, delay):
+    values.append(delay)
+
+
+@pytest.mark.asyncio
+async def test_http_transport_enforces_generic_concurrency_bound():
+    active = 0
+    maximum = 0
+    release = asyncio.Event()
+
+    async def requester(url, kwargs):
+        nonlocal active, maximum
+        del url, kwargs
+        active += 1
+        maximum = max(maximum, active)
+        await release.wait()
+        active -= 1
+        return HttpResponse(200, b"ok", "https://example.com")
+
+    transport = HttpTransport(requester=requester, max_concurrency=2)
+    tasks = [
+        asyncio.create_task(transport.request(HttpRequest(f"https://example.com/{i}")))
+        for i in range(5)
+    ]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert maximum == 2
+    release.set()
+    await asyncio.gather(*tasks)

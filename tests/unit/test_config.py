@@ -62,6 +62,20 @@ sync:
   rsync:
     enabled: true
     ssh_port: 22
+
+browser:
+  workers: 3
+  headless: true
+  profile_root: "./browser_profiles"
+  recycle_after_scopes: 25
+  proxy_strategy: round_robin
+  proxy_failure_cooldown_seconds: 45
+  proxies:
+    - "http://proxy-a"
+    - "http://proxy-b"
+  budgets:
+    forum: 2
+    news_detail: 1
 """,
     )
 
@@ -108,6 +122,12 @@ sync:
         config.sync.ssh_port
         == 22
     )
+
+    assert config.browser.workers == 3
+    assert config.browser.profile_root == (tmp_path / "browser_profiles").resolve()
+    assert config.browser.proxies == ("http://proxy-a", "http://proxy-b")
+    assert config.browser.proxy_failure_cooldown_seconds == 45
+    assert dict(config.browser.worker_budgets) == {"forum": 2, "news_detail": 1}
 
 
 def test_relative_paths_use_config_dir(

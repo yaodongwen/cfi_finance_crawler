@@ -361,6 +361,11 @@ class CanonicalRecord:
 
     scope_id: str | None = None
 
+    # Optional logical-identity scope. This lets an operational scope such as
+    # a crawl month differ from the source record's stable identity boundary.
+    identity_scope_type: str | None = None
+    identity_scope_id: str | None = None
+
 
     # --------------------------------------------------------
     # 常见证券
@@ -487,6 +492,14 @@ class CanonicalRecord:
             )
         )
 
+        self.identity_scope_type = normalize_optional_text(
+            self.identity_scope_type
+        )
+
+        self.identity_scope_id = normalize_optional_text(
+            self.identity_scope_id
+        )
+
         self.instrument_id = (
             normalize_optional_text(
                 self.instrument_id
@@ -603,13 +616,23 @@ class CanonicalRecord:
         不同股票下都不会发生冲突。
         """
 
+        identity_scope_type, identity_scope_id = self._identity_scope
+
         return stable_sha256(
             self.site_id,
             self.dataset,
-            self.scope_type,
-            self.scope_id or "",
+            identity_scope_type,
+            identity_scope_id or "",
             self.source_id,
         )
+
+
+    @property
+    def _identity_scope(self) -> tuple[str, str | None]:
+        if self.identity_scope_type is None:
+            return self.scope_type, self.scope_id
+
+        return self.identity_scope_type, self.identity_scope_id
 
 
     @property
@@ -650,12 +673,14 @@ class CanonicalRecord:
             )
         )
 
+        identity_scope_type, identity_scope_id = self._identity_scope
+
         return stable_sha256(
             self.site_id,
             self.dataset,
             self.source_id,
-            self.scope_type,
-            self.scope_id or "",
+            identity_scope_type,
+            identity_scope_id or "",
             self.instrument_id or "",
             datetime_to_iso_z(
                 self.event_time

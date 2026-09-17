@@ -1,0 +1,15 @@
+site_id: hkexnews
+
+country: HK
+
+timezone: Asia/Hong_Kong
+
+enabled: false
+
+transport:
+  type: http
+
+datasets:
+  - financial_report
+  - financial_report_instrument
+  - attachment

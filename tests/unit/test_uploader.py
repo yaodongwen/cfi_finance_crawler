@@ -151,6 +151,26 @@ def test_local_upload_keeps_source(
     )
 
 
+def test_local_verify_existing_does_not_require_reupload(tmp_path):
+    info = make_parquet_info(tmp_path)
+    uploader = LocalUploader(
+        tmp_path / "remote",
+        verify_size=True,
+        verify_sha256=True,
+    )
+    uploaded = uploader.upload(info)
+    info.file_path.unlink()
+
+    verified = uploader.verify_existing(
+        info,
+        remote_path=uploaded.remote_path,
+    )
+
+    assert verified.status == "verified"
+    assert verified.remote_size == info.file_size
+    assert verified.remote_sha256 == info.sha256
+
+
 def test_local_dry_run(
     tmp_path,
 ):

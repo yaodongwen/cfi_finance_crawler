@@ -167,6 +167,16 @@ class ResearchListItem:
         }
 
 
+def build_research_list_signature(
+    items: list[ResearchListItem],
+) -> tuple[str, ...]:
+    return tuple(
+        str(item.report_id).strip()
+        for item in items
+        if str(item.report_id).strip()
+    )
+
+
 def clean_text(
     value: Any,
 ) -> str:
@@ -1464,6 +1474,14 @@ class NaverResearchClient:
 
             existing_pages = 0
 
+            seen_page_signatures: dict[
+                tuple[
+                    str,
+                    ...
+                ],
+                int,
+            ] = {}
+
             while True:
 
                 if (
@@ -1497,6 +1515,22 @@ class NaverResearchClient:
                     continue
 
                 empty_pages = 0
+
+                page_signature = build_research_list_signature(
+                    items
+                )
+
+                first_seen_page = seen_page_signatures.get(
+                    page_signature
+                )
+
+                if first_seen_page is not None:
+
+                    break
+
+                seen_page_signatures[
+                    page_signature
+                ] = current_page
 
                 new_count = 0
 

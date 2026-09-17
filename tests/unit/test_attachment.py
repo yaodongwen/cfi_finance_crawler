@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 from datetime import datetime, timezone
 
 import pytest
@@ -5,6 +8,7 @@ import pytest
 from crawl_framework.core.adapter import (
     AttachmentRequest,
 )
+from crawl_framework.core.concurrency import GlobalStageBudget
 from crawl_framework.storage.attachment import (
     AttachmentPipeline,
     AttachmentContent,
@@ -54,6 +58,24 @@ def test_validate_attachment_content_checks_pdf_when_required():
                 mime_type="text/plain",
             ),
             require_pdf=True,
+        )
+
+    with pytest.raises(AttachmentDownloadError, match="PDF"):
+        validate_attachment_content(
+            AttachmentContent(
+                body=b"<html>blocked</html>",
+                mime_type="application/pdf",
+            ),
+            require_pdf=True,
+        )
+
+
+def test_validate_attachment_content_enforces_configurable_minimum_size():
+    with pytest.raises(AttachmentDownloadError, match="minimum"):
+        validate_attachment_content(
+            AttachmentContent(body=b"%PDF-short"),
+            require_pdf=True,
+            minimum_size_bytes=1024,
         )
 
 
@@ -115,6 +137,7 @@ def test_local_attachment_store_writes_stable_metadata(
         record.local_path.read_bytes()
         == body
     )
+    assert list(record.local_path.parent.glob("*.part")) == []
 
 
 class FakeDownloader:
@@ -185,6 +208,56 @@ def test_attachment_pipeline_downloads_stores_and_uploads(
         / "remote"
         / result.attachment.relative_path
     ).exists()
+
+
+@pytest.mark.asyncio
+async def test_attachment_pipelines_share_global_upload_budget(tmp_path):
+    class SlowUploader(LocalUploader):
+        def upload(self, item):
+            time.sleep(0.02)
+            return super().upload(item)
+
+    budget = GlobalStageBudget(
+        writer_workers=1,
+        upload_workers=1,
+        catalog_workers=1,
+    )
+
+    def pipeline(name):
+        return AttachmentPipeline(
+            downloader=FakeDownloader(),
+            store=LocalAttachmentStore(tmp_path / name / "warehouse"),
+            uploader=SlowUploader(
+                tmp_path / name / "remote",
+                verify_size=True,
+                verify_sha256=True,
+            ),
+            stage_budget=budget,
+        )
+
+    async def process(item, name):
+        return await item.process(
+            AttachmentRequest(
+                parent_record_uid=name,
+                source_url=f"https://example.com/{name}.pdf",
+                filename=f"{name}.pdf",
+                mime_type="application/pdf",
+            ),
+            site_id=name,
+            country="KR",
+            dataset="attachment",
+            require_pdf=True,
+        )
+
+    await asyncio.gather(
+        process(pipeline("left"), "left"),
+        process(pipeline("right"), "right"),
+    )
+
+    snapshot = budget.snapshot()
+    assert snapshot.writer.max_active == 1
+    assert snapshot.upload.max_active == 1
+    assert snapshot.upload.waits > 0
 
 
 def test_http_attachment_downloader_uses_response_headers():

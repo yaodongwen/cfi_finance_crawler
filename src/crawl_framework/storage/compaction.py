@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import uuid
 
 from dataclasses import dataclass
@@ -332,34 +333,32 @@ def deduplicate_table(
 
         return table
 
-    sort_keys = _table_sort_keys(
-        table
-    )
-
-    if sort_keys:
-
-        table = table.sort_by(
-            sort_keys
-        )
-
     rows = table.to_pylist()
 
-    positions: dict[str, int] = {}
+    positions: dict[str, tuple[tuple[int, Any, int], int]] = {}
 
     for index, row in enumerate(
         rows
     ):
 
-        positions[
-            str(
-                row[
-                    identity_column
-                ]
-            )
-        ] = index
+        identity = str(row[identity_column])
+        version_time = (
+            row.get("crawled_at")
+            or row.get("updated_at")
+            or row.get("event_time")
+        )
+        order = (
+            1 if version_time is not None else 0,
+            version_time,
+            index,
+        )
+        current = positions.get(identity)
+        if current is None or order > current[0]:
+            positions[identity] = (order, index)
 
     keep_positions = set(
-        positions.values()
+        position
+        for _, position in positions.values()
     )
 
     kept_rows = [
@@ -370,57 +369,76 @@ def deduplicate_table(
         if index in keep_positions
     ]
 
-    return pa.Table.from_pylist(
+    result = pa.Table.from_pylist(
         kept_rows,
         schema=table.schema,
     )
+
+    sort_keys = _table_sort_keys(result)
+    return result.sort_by(sort_keys) if sort_keys else result
 
 
 def _read_group_table(
     group: CompactionGroup,
     *,
     local_root: str | Path | None = None,
+    source_resolver: Any | None = None,
 ) -> pa.Table:
 
     tables = []
+    temp_context = tempfile.TemporaryDirectory(
+        prefix="crawl_framework_compaction_"
+    ) if source_resolver is not None else None
+    temp_dir = Path(temp_context.name) if temp_context is not None else None
 
-    for item in group.files:
+    try:
+        for item in group.files:
 
-        read_path: Path | str | None = None
+            read_path: Path | str | None = None
 
-        if local_root is not None:
+            if local_root is not None:
 
-            candidate = (
-                Path(
-                    local_root
+                candidate = (
+                    Path(
+                        local_root
+                    )
+                    / str(
+                        item.file_path
+                    )
                 )
-                / str(
-                    item.file_path
+
+                if candidate.exists():
+
+                    read_path = candidate
+
+            if not item.remote_path:
+
+                if read_path is None:
+
+                    raise ValueError(
+                        "active uploaded file has empty remote_path: "
+                        f"{item.file_path}"
+                    )
+
+            if read_path is None and source_resolver is not None:
+
+                read_path = source_resolver.materialize(
+                    item=item,
+                    temp_dir=temp_dir,
                 )
-            )
-
-            if candidate.exists():
-
-                read_path = candidate
-
-        if not item.remote_path:
 
             if read_path is None:
 
-                raise ValueError(
-                    "active uploaded file has empty remote_path: "
-                    f"{item.file_path}"
+                read_path = item.remote_path
+
+            tables.append(
+                pq.read_table(
+                    read_path
                 )
-
-        if read_path is None:
-
-            read_path = item.remote_path
-
-        tables.append(
-            pq.read_table(
-                read_path
             )
-        )
+    finally:
+        if temp_context is not None:
+            temp_context.cleanup()
 
     if not tables:
 
@@ -521,6 +539,7 @@ def write_compacted_group(
     *,
     output_root: str | Path,
     source_root: str | Path | None = None,
+    source_resolver: Any | None = None,
     dry_run: bool = False,
     compression: str = "zstd",
 ) -> CompactionResult:
@@ -538,6 +557,7 @@ def write_compacted_group(
     table = _read_group_table(
         group,
         local_root=source_root,
+        source_resolver=source_resolver,
     )
 
     compacted = deduplicate_table(
@@ -765,6 +785,7 @@ def compact_active_dataset(
     dataset: str,
     country: str | None = None,
     warehouse_root: str | Path,
+    source_resolver: Any | None = None,
     min_file_count: int = 2,
     dry_run: bool = False,
     compression: str = "zstd",
@@ -801,6 +822,7 @@ def compact_active_dataset(
             group,
             output_root=warehouse_root,
             source_root=warehouse_root,
+            source_resolver=source_resolver,
             dry_run=dry_run,
             compression=compression,
         )

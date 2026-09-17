@@ -1275,6 +1275,54 @@ def test_instrument_bucket_matches_partitioner():
         "f1"
     )
 
+
+def test_normalize_query_uses_dataset_partition_bucket_count():
+    report_relation = normalize_query(
+        QuerySpec(
+            site_id="hkexnews",
+            dataset="financial_report_instrument",
+            country="HK",
+            instrument_id="XHKG:00016",
+        )
+    )
+    forum = normalize_query(
+        QuerySpec(
+            site_id="naver_finance",
+            dataset="forum_post",
+            country="KR",
+            instrument_id="XKRX:042700",
+        )
+    )
+
+    from crawl_framework.storage.query import instrument_bucket
+
+    legacy_bucket = instrument_bucket("XHKG:00016", bucket_count=256)
+
+    assert report_relation.bucket is None
+    assert report_relation.buckets == ("00", legacy_bucket)
+    assert forum.bucket == "20"
+    assert forum.buckets == ("20",)
+
+
+def test_financial_report_date_range_includes_year_partition():
+    from crawl_framework.storage.query import catalog_partition_date_range
+
+    query = normalize_query(
+        QuerySpec(
+            site_id="hkexnews",
+            dataset="financial_report_instrument",
+            country="HK",
+            start_date="2026-10-12",
+            end_date="2026-10-12",
+            timezone="Asia/Hong_Kong",
+        )
+    )
+
+    first, last = catalog_partition_date_range(query)
+
+    assert first == date(2026, 1, 1)
+    assert last == date(2026, 10, 12)
+
 def test_query_instrument_uses_bucket_pruning(
     tmp_path,
 ):

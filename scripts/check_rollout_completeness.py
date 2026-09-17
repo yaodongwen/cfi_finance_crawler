@@ -16,6 +16,8 @@ from typing import (
 
 
 INSTRUMENT_SCOPED_DATASETS = {
+    "financial_report",
+    "financial_report_instrument",
     "forum_post",
     "news_article",
     "news_instrument",
@@ -47,6 +49,11 @@ class DatasetAudit:
     missing_checkpoints: int | None
     files_in_catalog: int | None
     attachments_pending: int | None = None
+    natural_complete_scopes: int = 0
+    free_access_complete_scopes: int = 0
+    partial_scopes: int = 0
+    failed_scopes: int = 0
+    missing_scopes: int = 0
 
 
 @dataclass(
@@ -66,6 +73,10 @@ class CompletenessAudit:
     terminal_failed_recovery: int
     files_in_catalog: int
     attachments_pending: int
+    natural_complete_scopes: int
+    free_access_complete_scopes: int
+    partial_scopes: int
+    missing_scopes: int
     complete: bool
     dataset_audits: tuple[DatasetAudit, ...]
     problems: tuple[str, ...]
@@ -172,6 +183,79 @@ def checkpoint_count(
         1
         for path in root.rglob("*.json")
         if path.is_file()
+    )
+
+
+def kabutan_month_status_counts(
+    *,
+    checkpoint_root: Path,
+    expected_months: tuple[str, ...],
+) -> dict[str, int]:
+    root = checkpoint_root / "site=kabutan" / "dataset=news_article" / "scope=month"
+    counts = {
+        "natural": 0,
+        "free_access": 0,
+        "partial": 0,
+        "failed": 0,
+        "missing": 0,
+    }
+    failure_reasons = {"http_failure", "parser_failure", "interrupted"}
+    for month_id in expected_months:
+        path = root / f"{month_id.replace('-', '')}.json"
+        if not path.is_file():
+            counts["missing"] += 1
+            continue
+        try:
+            payload = load_json(path)
+        except Exception:
+            counts["failed"] += 1
+            continue
+        state = payload.get("state", {})
+        if (
+            isinstance(state, dict)
+            and state.get("month_complete") is True
+            and state.get("archive_access_validated") is True
+        ):
+            counts["natural"] += 1
+        elif (
+            isinstance(state, dict)
+            and state.get("free_access_complete") is True
+            and state.get("stop_reason") == "free_access_boundary"
+        ):
+            counts["free_access"] += 1
+        elif isinstance(state, dict) and state.get("stop_reason") in failure_reasons:
+            counts["failed"] += 1
+        else:
+            counts["partial"] += 1
+    return counts
+
+
+def expected_kabutan_months(manifest: dict[str, Any]) -> tuple[str, ...]:
+    scope_plan = manifest.get("scope_plan")
+    if isinstance(scope_plan, dict) and scope_plan.get("scope_type") == "month":
+        values = scope_plan.get("scope_ids", ())
+        if isinstance(values, list):
+            return tuple(str(value) for value in values)
+
+    options = manifest.get("options", {})
+    if not isinstance(options, dict):
+        options = {}
+    from datetime import datetime
+    from crawl_framework.sites.kabutan.market_news import resolve_month_window
+
+    timestamp = manifest.get("started_at") or manifest.get("finished_at")
+    now = datetime.fromisoformat(str(timestamp)) if timestamp else None
+    profile = str(manifest.get("profile") or "")
+    return resolve_month_window(
+        mode=(
+            "free_full"
+            if profile in {"kabutan_free_full", "kabutan_full"}
+            else "incremental"
+        ),
+        start_month=options.get("kabutan_start_month"),
+        end_month=options.get("kabutan_end_month"),
+        overlap_months=int(options.get("kabutan_overlap_months", 1) or 0),
+        now=now,
     )
 
 
@@ -404,20 +488,49 @@ def audit_manifest(
     expected_total = 0
     completed_total = 0
     missing_total = 0
+    natural_complete_total = 0
+    free_access_complete_total = 0
+    partial_total = 0
+    checkpoint_failed_total = 0
+    actual_missing_total = 0
     problems: list[str] = []
 
     for dataset in datasets:
-        expected = expected_for_dataset(
-            dataset=dataset,
-            effective_instrument_count=(
-                effective_instrument_count
-            ),
-        )
-        completed = checkpoint_count(
-            checkpoint_root=checkpoint_root,
-            site=site,
-            dataset=dataset,
-        )
+        if site == "kabutan" and dataset == "news_article":
+            month_ids = expected_kabutan_months(manifest)
+            expected = len(month_ids)
+            status_counts = kabutan_month_status_counts(
+                checkpoint_root=checkpoint_root,
+                expected_months=month_ids,
+            )
+            natural_complete = status_counts["natural"]
+            free_access_complete = status_counts["free_access"]
+            partial = status_counts["partial"]
+            checkpoint_failed = status_counts["failed"]
+            actual_missing = status_counts["missing"]
+            completed = natural_complete + free_access_complete
+        else:
+            expected = expected_for_dataset(
+                dataset=dataset,
+                effective_instrument_count=(
+                    effective_instrument_count
+                ),
+            )
+            completed = checkpoint_count(
+                checkpoint_root=checkpoint_root,
+                site=site,
+                dataset=dataset,
+            )
+            natural_complete = completed
+            free_access_complete = 0
+            partial = 0
+            checkpoint_failed = 0
+            actual_missing = 0
+
+        natural_complete_total += natural_complete
+        free_access_complete_total += free_access_complete
+        partial_total += partial
+        checkpoint_failed_total += checkpoint_failed
 
         if expected is None:
             missing = None
@@ -432,10 +545,17 @@ def audit_manifest(
                 0,
             )
             missing_total += missing
+            if site != "kabutan" or dataset != "news_article":
+                actual_missing = missing
+            actual_missing_total += actual_missing
             if missing:
                 problems.append(
                     f"{dataset} missing checkpoints: {missing}"
                 )
+            if partial:
+                problems.append(f"{dataset} partial scopes: {partial}")
+            if checkpoint_failed:
+                problems.append(f"{dataset} failed scopes: {checkpoint_failed}")
 
         dataset_audits.append(
             DatasetAudit(
@@ -444,6 +564,11 @@ def audit_manifest(
                 completed_scopes=completed,
                 missing_checkpoints=missing,
                 files_in_catalog=None,
+                natural_complete_scopes=natural_complete,
+                free_access_complete_scopes=free_access_complete,
+                partial_scopes=partial,
+                failed_scopes=checkpoint_failed,
+                missing_scopes=actual_missing,
             )
         )
 
@@ -482,7 +607,10 @@ def audit_manifest(
             "catalog_jobs_completed",
         )
 
-    if files_in_catalog <= 0:
+    if files_in_catalog <= 0 and (
+        runtime_value(manifest, "records_crawled") > 0
+        or missing_total > 0
+    ):
         problems.append(
             "manifest/runtime reports no catalog-registered files"
         )
@@ -497,11 +625,15 @@ def audit_manifest(
         expected_scopes=expected_total,
         completed_scopes=completed_total,
         missing_checkpoints=missing_total,
-        failed_scopes=runtime_errors,
+        failed_scopes=checkpoint_failed_total + runtime_errors,
         pending_recovery=pending_recovery,
         terminal_failed_recovery=failed_recovery,
         files_in_catalog=files_in_catalog,
         attachments_pending=attachment_pending,
+        natural_complete_scopes=natural_complete_total,
+        free_access_complete_scopes=free_access_complete_total,
+        partial_scopes=partial_total,
+        missing_scopes=actual_missing_total,
         complete=complete,
         dataset_audits=tuple(dataset_audits),
         problems=tuple(problems),
@@ -584,6 +716,11 @@ def main(
         print(
             f"completed_scopes={audit.completed_scopes}"
         )
+        print(f"natural_complete_scopes={audit.natural_complete_scopes}")
+        print(f"free_access_complete_scopes={audit.free_access_complete_scopes}")
+        print(f"partial_scopes={audit.partial_scopes}")
+        print(f"failed_scopes={audit.failed_scopes}")
+        print(f"missing_scopes={audit.missing_scopes}")
         print(
             f"missing_checkpoints={audit.missing_checkpoints}"
         )

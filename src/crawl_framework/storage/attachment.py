@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import mimetypes
+import os
 import time
+import uuid
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -235,12 +238,16 @@ def validate_attachment_content(
     content: AttachmentContent,
     *,
     require_pdf: bool = False,
+    minimum_size_bytes: int = 1,
 ) -> None:
 
-    if not content.body:
+    if minimum_size_bytes < 1:
+        raise ValueError("minimum_size_bytes must be positive")
+
+    if len(content.body) < minimum_size_bytes:
 
         raise AttachmentDownloadError(
-            "attachment body is empty"
+            "attachment body is empty or smaller than the required minimum"
         )
 
     mime_type = (
@@ -250,12 +257,7 @@ def validate_attachment_content(
 
     if (
         require_pdf
-        and not (
-            content.body.startswith(
-                b"%PDF"
-            )
-            or "pdf" in mime_type
-        )
+        and not content.body.startswith(b"%PDF-")
     ):
 
         raise AttachmentDownloadError(
@@ -321,11 +323,13 @@ class LocalAttachmentStore:
         dataset: str,
         event_time: datetime | None = None,
         require_pdf: bool = False,
+        minimum_size_bytes: int = 1,
     ) -> AttachmentRecord:
 
         validate_attachment_content(
             content,
             require_pdf=require_pdf,
+            minimum_size_bytes=minimum_size_bytes,
         )
 
         sha = attachment_sha256(
@@ -374,9 +378,17 @@ class LocalAttachmentStore:
             exist_ok=True,
         )
 
-        local_path.write_bytes(
-            content.body
+        temporary_path = local_path.with_name(
+            f".{local_path.name}.{uuid.uuid4().hex}.part"
         )
+        try:
+            with temporary_path.open("wb") as handle:
+                handle.write(content.body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, local_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
         return AttachmentRecord(
             attachment_id=sha,
@@ -419,6 +431,7 @@ class AttachmentPipeline:
         downloader: AttachmentDownloader,
         store: LocalAttachmentStore,
         uploader: BaseUploader,
+        stage_budget=None,
     ) -> None:
 
         self.downloader = downloader
@@ -426,6 +439,7 @@ class AttachmentPipeline:
         self.store = store
 
         self.uploader = uploader
+        self.stage_budget = stage_budget
 
 
     async def process(
@@ -437,25 +451,43 @@ class AttachmentPipeline:
         dataset: str,
         event_time: datetime | None = None,
         require_pdf: bool = False,
+        minimum_size_bytes: int = 1,
     ) -> AttachmentProcessResult:
 
         content = await self.downloader.download(
             request
         )
 
-        attachment = self.store.store(
-            request,
-            content,
-            site_id=site_id,
-            country=country,
-            dataset=dataset,
-            event_time=event_time,
-            require_pdf=require_pdf,
-        )
-
-        upload_result = self.uploader.upload(
-            attachment
-        )
+        if self.stage_budget is None:
+            attachment = self.store.store(
+                request,
+                content,
+                site_id=site_id,
+                country=country,
+                dataset=dataset,
+                event_time=event_time,
+                require_pdf=require_pdf,
+                minimum_size_bytes=minimum_size_bytes,
+            )
+            upload_result = self.uploader.upload(attachment)
+        else:
+            async with self.stage_budget.writer_slot():
+                attachment = await asyncio.to_thread(
+                    self.store.store,
+                    request,
+                    content,
+                    site_id=site_id,
+                    country=country,
+                    dataset=dataset,
+                    event_time=event_time,
+                    require_pdf=require_pdf,
+                    minimum_size_bytes=minimum_size_bytes,
+                )
+            async with self.stage_budget.upload_slot():
+                upload_result = await asyncio.to_thread(
+                    self.uploader.upload,
+                    attachment,
+                )
 
         return AttachmentProcessResult(
             attachment=attachment,

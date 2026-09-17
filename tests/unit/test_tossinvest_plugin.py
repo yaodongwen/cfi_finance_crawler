@@ -63,6 +63,18 @@ async def test_tossinvest_discover_forum_instruments():
 
 
 @pytest.mark.asyncio
+async def test_tossinvest_discover_accepts_production_instrument_codes_key():
+    scopes = [
+        scope
+        async for scope in TossInvestPlugin().discover(
+            "forum_post",
+            CrawlContext(extra={"instrument_codes": ["005930"]}),
+        )
+    ]
+    assert [scope.source_key for scope in scopes] == ["A005930"]
+
+
+@pytest.mark.asyncio
 async def test_tossinvest_crawl_uses_fixture_and_checkpoint():
 
     plugin = TossInvestPlugin()
@@ -193,10 +205,44 @@ def test_tossinvest_metadata_and_symbol_helpers():
     assert plugin.validate_datasets() == (
         "forum_post",
         "news_article",
+        "news_instrument",
     )
     assert normalize_toss_symbol(
         "A005930"
     ) == "005930"
+    assert normalize_toss_symbol(
+        "XKRX:005930"
+    ) == "005930"
     assert toss_instrument_id(
         "A005930"
     ) == "XKRX:005930"
+    assert toss_instrument_id(
+        "XKRX:005930"
+    ) == "XKRX:005930"
+
+
+def test_toss_news_article_identity_is_global_and_relation_is_materialized():
+    plugin = TossInvestPlugin()
+    raw = {
+        "news_id": "shared-news", "title": "shared", "content": "body",
+        "published_at": "2026-09-07T10:00:00+09:00", "stock_key": "A005930",
+        "news_url": "https://toss/news/shared",
+    }
+    samsung_scope = CrawlScope(scope_type="instrument", scope_id="XKRX:005930", source_key="A005930")
+    hynix_scope = CrawlScope(scope_type="instrument", scope_id="XKRX:000660", source_key="A000660")
+    samsung = plugin.normalize("news_article", raw, samsung_scope)
+    hynix = plugin.normalize("news_article", {**raw, "stock_key": "A000660"}, hynix_scope)
+    assert samsung.record_uid == hynix.record_uid
+    assert samsung.scope_type == "global" and samsung.scope_id is None
+
+    relation = plugin.normalize("news_instrument", raw, samsung_scope)
+    assert relation.source_id == "shared-news:XKRX:005930"
+    assert relation.instrument_id == "XKRX:005930"
+    assert relation.payload["article_source_id"] == "shared-news"
+    assert relation.payload["relation_schema_version"] == 2
+    renamed_relation = plugin.normalize(
+        "news_instrument",
+        {**raw, "title": "transient navigation heading"},
+        samsung_scope,
+    )
+    assert renamed_relation.version_hash == relation.version_hash

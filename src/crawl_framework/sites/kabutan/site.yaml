@@ -1,0 +1,13 @@
+site_id: kabutan
+
+country: JP
+
+timezone: Asia/Tokyo
+
+enabled: false
+
+transport:
+  type: http
+
+datasets:
+  - news_article

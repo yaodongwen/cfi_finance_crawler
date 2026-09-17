@@ -69,6 +69,36 @@ def checkpoint(
     )
 
 
+def kabutan_checkpoint(
+    root: Path,
+    month: str,
+    *,
+    complete: bool,
+    reason: str,
+    access_validated: bool = True,
+    free_access_complete: bool = False,
+) -> None:
+    write_json(
+        root
+        / "site=kabutan"
+        / "dataset=news_article"
+        / "scope=month"
+        / f"{month.replace('-', '')}.json",
+        {
+            "state": {
+                "year": int(month[:4]),
+                "month": int(month[5:]),
+                "last_completed_page": 3,
+                "last_news_id": "n202609100001",
+                "month_complete": complete,
+                "free_access_complete": free_access_complete,
+                "stop_reason": reason,
+                "archive_access_validated": access_validated,
+            }
+        },
+    )
+
+
 def manifest_payload(
     universe: Path,
 ):
@@ -170,6 +200,161 @@ def test_audit_manifest_reports_complete_run(
     assert audit.pending_recovery == 0
 
 
+def test_kabutan_audit_requires_complete_expected_month_checkpoints(tmp_path):
+    manifest = tmp_path / "kabutan.json"
+    write_json(manifest, {
+        "run_id": "kabutan-run",
+        "site": "kabutan",
+        "profile": "kabutan_full",
+        "datasets": ["news_article"],
+        "universe": {"count": 0},
+        "scope_plan": {
+            "scope_type": "month",
+            "scope_ids": ["2026-07", "2026-08", "2026-09"],
+            "count": 3,
+        },
+        "options": {},
+        "runtime": {"files_registered": 2, "errors": 0},
+    })
+    checkpoints = tmp_path / "checkpoints"
+    kabutan_checkpoint(checkpoints, "2026-07", complete=True, reason="empty_page")
+    kabutan_checkpoint(
+        checkpoints, "2026-08", complete=False, reason="safety_capped"
+    )
+    kabutan_checkpoint(
+        checkpoints, "2026-09", complete=True, reason="repeated_page_signature"
+    )
+
+    audit = audit_manifest(
+        manifest_path=manifest,
+        checkpoint_root=checkpoints,
+        recovery_root=tmp_path / "recovery",
+    )
+
+    assert audit.expected_scopes == 3
+    assert audit.completed_scopes == 2
+    assert audit.missing_checkpoints == 1
+    assert audit.natural_complete_scopes == 2
+    assert audit.free_access_complete_scopes == 0
+    assert audit.partial_scopes == 1
+    assert audit.missing_scopes == 0
+    assert audit.complete is False
+    assert "news_article missing checkpoints: 1" in audit.problems
+
+
+def test_kabutan_audit_rejects_legacy_complete_without_archive_validation(tmp_path):
+    manifest = tmp_path / "kabutan-legacy.json"
+    write_json(manifest, {
+        "run_id": "kabutan-legacy",
+        "site": "kabutan",
+        "profile": "kabutan_full",
+        "datasets": ["news_article"],
+        "scope_plan": {
+            "scope_type": "month",
+            "scope_ids": ["2026-07"],
+            "count": 1,
+        },
+        "options": {},
+        "runtime": {"files_registered": 0, "errors": 0},
+    })
+    checkpoints = tmp_path / "checkpoints"
+    kabutan_checkpoint(
+        checkpoints,
+        "2026-07",
+        complete=True,
+        reason="empty_page",
+        access_validated=False,
+    )
+
+    audit = audit_manifest(
+        manifest_path=manifest,
+        checkpoint_root=checkpoints,
+        recovery_root=tmp_path / "recovery",
+    )
+
+    assert audit.complete is False
+    assert audit.completed_scopes == 0
+    assert audit.missing_checkpoints == 1
+    assert audit.partial_scopes == 1
+    assert audit.missing_scopes == 0
+
+
+def test_kabutan_free_access_boundary_is_complete_not_missing(tmp_path):
+    manifest = tmp_path / "kabutan-free.json"
+    write_json(manifest, {
+        "run_id": "kabutan-free",
+        "site": "kabutan",
+        "profile": "kabutan_free_full",
+        "datasets": ["news_article"],
+        "scope_plan": {
+            "scope_type": "month",
+            "scope_ids": ["2026-09", "2026-08"],
+            "count": 2,
+        },
+        "options": {},
+        "runtime": {"files_registered": 1, "errors": 0},
+    })
+    checkpoints = tmp_path / "checkpoints"
+    kabutan_checkpoint(checkpoints, "2026-09", complete=True, reason="empty_page")
+    kabutan_checkpoint(
+        checkpoints,
+        "2026-08",
+        complete=False,
+        reason="free_access_boundary",
+        access_validated=False,
+        free_access_complete=True,
+    )
+
+    audit = audit_manifest(
+        manifest_path=manifest,
+        checkpoint_root=checkpoints,
+        recovery_root=tmp_path / "recovery",
+    )
+
+    assert audit.complete is True
+    assert audit.completed_scopes == 2
+    assert audit.natural_complete_scopes == 1
+    assert audit.free_access_complete_scopes == 1
+    assert audit.partial_scopes == 0
+    assert audit.failed_scopes == 0
+    assert audit.missing_scopes == 0
+    assert audit.missing_checkpoints == 0
+
+
+def test_complete_zero_record_resume_does_not_require_new_catalog_jobs(tmp_path):
+    manifest = tmp_path / "kabutan-resume.json"
+    write_json(manifest, {
+        "run_id": "kabutan-resume",
+        "site": "kabutan",
+        "profile": "kabutan_full",
+        "datasets": ["news_article"],
+        "scope_plan": {
+            "scope_type": "month",
+            "scope_ids": ["2026-08"],
+            "count": 1,
+        },
+        "options": {},
+        "runtime": {
+            "production_stats": {
+                "records_crawled": 0,
+                "catalog_jobs_completed": 0,
+                "errors": 0,
+            }
+        },
+    })
+    checkpoints = tmp_path / "checkpoints"
+    kabutan_checkpoint(checkpoints, "2026-08", complete=True, reason="empty_page")
+
+    audit = audit_manifest(
+        manifest_path=manifest,
+        checkpoint_root=checkpoints,
+        recovery_root=tmp_path / "recovery",
+    )
+
+    assert audit.complete is True
+    assert audit.files_in_catalog == 0
+
+
 def test_audit_manifest_uses_instrument_limit_and_production_stats(
     tmp_path,
 ):
@@ -241,6 +426,97 @@ def test_audit_manifest_uses_instrument_limit_and_production_stats(
     assert audit.expected_scopes == 5
     assert audit.files_in_catalog == 5
     assert audit.missing_checkpoints == 0
+
+
+def test_hkex_financial_report_datasets_require_every_instrument_checkpoint(
+    tmp_path,
+):
+    universe = tmp_path / "hkex.txt"
+    universe.write_text(
+        "XHKG:00001\nXHKG:00002\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "hkex-manifest.json"
+    write_json(
+        manifest,
+        {
+            "run_id": "hkex-run",
+            "site": "hkexnews",
+            "profile": "hkex_reports_full",
+            "datasets": [
+                "financial_report",
+                "financial_report_instrument",
+            ],
+            "universe": {
+                "path": str(universe),
+                "count": 2,
+            },
+            "options": {
+                "instrument_limit": 2,
+                "instruments": [
+                    "XHKG:00001",
+                    "XHKG:00002",
+                ],
+            },
+            "runtime": {
+                "production_stats": {
+                    "catalog_jobs_completed": 1,
+                    "errors": 0,
+                },
+            },
+        },
+    )
+    checkpoints = tmp_path / "checkpoints"
+    for dataset in (
+        "financial_report",
+        "financial_report_instrument",
+    ):
+        checkpoint(
+            checkpoints,
+            site="hkexnews",
+            dataset=dataset,
+            scope="XHKG:00001",
+        )
+        checkpoint(
+            checkpoints,
+            site="hkexnews",
+            dataset=dataset,
+            scope="XHKG:00002",
+        )
+
+    audit = audit_manifest(
+        manifest_path=manifest,
+        checkpoint_root=checkpoints,
+        recovery_root=tmp_path / "recovery",
+    )
+
+    assert audit.complete is True
+    assert audit.expected_scopes == 4
+    assert audit.completed_scopes == 4
+    assert audit.missing_checkpoints == 0
+    assert [item.expected_scopes for item in audit.dataset_audits] == [2, 2]
+
+    (
+        checkpoints
+        / "site=hkexnews"
+        / "dataset=financial_report_instrument"
+        / "scope=instrument"
+        / "XHKG:00002.json"
+    ).unlink()
+
+    incomplete = audit_manifest(
+        manifest_path=manifest,
+        checkpoint_root=checkpoints,
+        recovery_root=tmp_path / "recovery",
+    )
+
+    assert incomplete.complete is False
+    assert incomplete.expected_scopes == 4
+    assert incomplete.completed_scopes == 3
+    assert incomplete.missing_checkpoints == 1
+    assert incomplete.problems == (
+        "financial_report_instrument missing checkpoints: 1",
+    )
 
 
 def test_audit_manifest_reports_missing_checkpoint_and_recovery(

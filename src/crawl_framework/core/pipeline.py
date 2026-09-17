@@ -823,6 +823,7 @@ class StoragePipeline:
                     record_index_info
                     .file_path
                 ),
+                scope_tokens=batch.scope_tokens,
             )
         )
 
@@ -1088,6 +1089,7 @@ class StoragePipeline:
         info: ParquetFileInfo,
         *,
         record_index_path,
+        scope_tokens=(),
     ) -> RecoveryManifest:
         """
         根据 ParquetFileInfo 创建 RecoveryManifest。
@@ -1129,6 +1131,7 @@ class StoragePipeline:
             file_size=(
                 info.file_size
             ),
+            scope_tokens=tuple(scope_tokens),
             record_index_path=(
                 record_index_path
                 .as_posix()

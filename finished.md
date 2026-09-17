@@ -9,7 +9,7 @@
 ```text
 conda activate pac
 pytest -q -p no:rerunfailures tests/unit
-642 passed
+647 passed
 ```
 
 ## Core Framework
@@ -332,6 +332,20 @@ remaining_pending=0
 ## Naver Research Reports
 
 I3 已完成真实 Naver research metadata client 迁入，并通过 production CLI smoke。
+
+2026-09-07 补齐 old `naver_research_core.py` 已验证的
+repeated-final-page protection：
+
+- 新增 `build_research_list_signature(items)`；
+- `NaverResearchClient.crawl_pages()` 对每个 research category
+  独立维护 page signature；
+- repeated signature 检测发生在 list fetch 和 empty-page 逻辑之后、
+  detail fetch 之前；
+- full / incremental 两种模式都生效；
+- incremental `existing_pages` stop 保持独立语义；
+- deterministic unit tests 覆盖 empty page、repeated final page、
+  per-category signature reset、incremental existing-pages stop；
+- 只读真实 HTTP smoke 已验证 `market` full mode 前 3 页均可解析。
 
 I4 已完成当前框架内的 research relation modeling：
 
@@ -793,3 +807,1067 @@ Not yet migrated as real production site capability:
 | Full-scale attachment rollout | `naver_research/naver_research_core.py` | PDF semaphore/retry/full category behavior | one-PDF smoke passed; larger PDF rollout remains pending |
 
 A feature must not be moved from TODO to Finished merely because a FakeClient test passes. The real HTTP implementation, production wiring, generic durable pipeline, and real smoke test must all pass.
+
+# Finished Update — TossInvest Current Facts
+
+> Do not delete existing framework/Naver completed history.
+>
+> Add/update the following Toss section.
+>
+> Do NOT mark real Toss crawling as complete yet.
+
+# TossInvest Completed Foundations
+
+## Architecture compatibility proof
+
+Completed:
+
+```text
+TossInvest site is registered in builtin site registry
+TossInvestPlugin exists
+canonical XKRX symbol mapping exists
+forum_post normalization exists
+news_article normalization exists
+RecordRelation generation exists
+generic runtime/storage/query architecture reuse has fixture-backed tests
+```
+
+Current plugin datasets:
+
+```text
+forum_post
+news_article
+```
+
+Current significance:
+
+```text
+The generic framework can structurally host TossInvest without redesigning
+Parquet, Catalog, SeenStore, checkpoint, recovery, upload, query or
+ConcurrentProductionRuntime.
+```
+
+## Important limitation
+
+The following must NOT be listed as finished yet:
+
+```text
+real Toss Screener discovery
+real Toss forum/community HTTP/Playwright crawl
+real Toss news list crawl
+real Toss news detail crawl
+full old-field parity
+real Toss Playwright production transport
+real Toss production rollout
+```
+
+Those remain in `problem.md` and Phase J of `todo.md`.
+
+## Legacy project capabilities available for migration
+
+The old repository already contains proven implementations for:
+
+```text
+domestic Screener discovery
+virtual-list scrolling
+forum/community crawl
+forum incremental mode
+news full historical baseline
+news incremental mode
+news pending resume
+metadata-v4 news parser
+Playwright concurrency
+proxy use
+legacy persistent ID cache
+Ctrl+C resume semantics
+```
+
+These are reference inputs for Phase J, not yet completed target-framework features.
+
+## J0 repository audit and legacy traceability
+
+Completed on 2026-09-07 against the current worktree and the local legacy
+checkout at `crawl_tossinvest/tossinvest_crawler_v2`.
+
+The audited capability classification is:
+
+```text
+A real production-wired:
+  builtin site registration and generic runtime/storage/query infrastructure
+
+B fixture-backed only:
+  TossInvestPlugin.crawl() and architecture/runtime smoke coverage
+
+C interface/normalization only:
+  XKRX symbol mapping, forum_post normalization, news_article relations
+
+D missing before Phase J implementation:
+  generic Playwright transport, real Screener discovery, real forum client,
+  real news list/detail client, browser ProxyPool wiring, real rollout
+```
+
+Reviewed legacy sources include `crawler.py`, `collect_stocks.py`,
+`normalizer.py`, `cache_manager.py`, `production_runner.py`, `main.py`, and
+`README.md`. Only Toss-specific navigation, selectors, parsing, identity,
+field provenance, and resume semantics are migration inputs; legacy JSONL,
+site-owned dedup/Parquet/Catalog/upload and subprocess runner architecture are
+explicitly excluded.
+
+## J1 generic Playwright transport/browser worker pool
+
+Completed on 2026-09-07 in
+`src/crawl_framework/transports/playwright.py`.
+
+Implemented generic Playwright/Chromium start-stop lifecycle, bounded browser
+leases, isolated ephemeral contexts or per-worker persistent profile paths,
+locale/timezone/viewport and timeout configuration, context recycling, crash
+cleanup, graceful shutdown, and ProxyPool selection/success/failure reporting.
+No Toss DOM selectors or storage behavior were added to the transport.
+
+Validation:
+
+```text
+focused Playwright/transport tests: 11 passed
+full tests/unit: 651 passed
+real Chromium smoke: data page title=cfw-smoke, workers=1, max_active=1
+```
+
+## J2 real Toss instrument discovery
+
+Completed on 2026-09-07 with the real Toss Screener and production plugin
+discovery interface. `TossInvestInstrumentClient` switches to the domestic
+market, protects baseline filters while removing extras, parses real virtual
+rows, scrolls to a stable bottom, deduplicates by `stock_key`, and maps
+`A005930` to `XKRX:005930`.
+
+The authoritative snapshot is
+`config/universes/tossinvest_kr_rollout_universe.txt`: `2427` current KR
+instruments in Toss discovery order. It was generated from the real Screener,
+not fixtures or a historical hard-coded list.
+
+Validation:
+
+```text
+focused tests: 20 passed
+full tests/unit: 655 passed
+real full discovery: 2427 instruments
+real plugin smoke: 5 instruments, expected stable prefix
+```
+
+## J3 real Toss forum/community client
+
+Completed on 2026-09-07. The real client opens a stock community, selects the
+latest ordering, parses virtual cards, supports full/incremental stopping, and
+automatically warms a fresh Toss SPA profile through the Screener before
+retrying a direct stock deep-link.
+
+The final durable smoke used the formal AppFactory/Bootstrap composition and
+the production TossInvestPlugin with the generic concurrent runtime, bounded
+queues, Parquet, LocalUploader verification, PostgresCatalog API, record
+index, SeenStore, checkpoint and RecoveryStore.
+
+```text
+success=true raw_count=7 normalized_count=7
+records_new=7 unchanged=0 updated=0
+files_written=1 uploaded=1 verified=1 registered=1
+pipeline_errors=0 remaining_pending=0 checkpoint=complete
+crawl/writer/upload/catalog workers=2/1/1/1
+max queue depth record/upload/catalog=8/1/1
+queue capacity record/upload/catalog=1000/128/128
+focused tests=47 passed; full tests/unit=658 passed
+```
+
+## J4 Toss forum full field parity
+
+Completed on 2026-09-07. Legacy `normalizer.py::normalize_comment`,
+`parse_relative_comment_time`, and the real card parser fields are mapped to
+CanonicalRecord/payload: post ID, author, profile image, approximate event
+time plus quality/raw text, follower/shareholder flags, content/raw text,
+engagement counts, stock name/URL and Toss stock key.
+
+Logical identity uses the real post ID. Engagement changes retain the same
+`record_uid` but produce a new `version_hash`; forum records use the framework
+`latest` policy. The legacy standalone Normalizer/JSONL chain was not copied.
+
+Validation: focused `11 passed`, full unit `659 passed`; real durable
+regression smoke succeeded with 10 raw/normalized records, one file through
+write/upload/verify/register, zero errors and pending recovery.
+
+## J5 real Toss news list discovery
+
+Completed on 2026-09-07. Production plugin wiring uses the real Playwright
+news list client, Toss `contentParams.id` identity, virtual-list stable-bottom
+scrolling and stock relation evidence. Historical baseline incomplete and
+incremental history-only stopping remain distinct. Real Samsung smoke found
+16 links in two rounds. Focused tests `14 passed`; full unit `663 passed`.
+This does not yet mark the `news_article` dataset complete; detail parsing and
+durable real smoke remain J6-J8 acceptance work.
+
+## J6 real Toss news detail parser
+
+Completed on 2026-09-07. Detail extraction follows page JSON, metadata,
+article headings, list text, then auditable publisher/date/author fallbacks.
+All required provenance and raw fields are preserved; absent metadata remains
+blank. Real Samsung detail and AppFactory durable smokes passed.
+
+```text
+raw/normalized=1/1; new=1
+files written/uploaded/verified/registered=1/1/1/1
+errors=0 pending=0 checkpoint=complete
+focused=44 passed; full unit=666 passed
+```
+
+## J7 Toss news article/instrument relations
+
+Completed on 2026-09-07. `news_article` uses global identity so the same Toss
+`news_id` reached from multiple stocks has one body record. `news_instrument`
+materializes one `news_id:XKRX:*` relation per stock. Real relation durable
+smoke persisted one record through all stages with pending 0 and complete
+checkpoint. Focused `51 passed`; full unit `667 passed`.
+
+## J8 Toss historical baseline and pending/resume semantics
+
+Completed on 2026-09-07. Baseline-incomplete crawls never enable known-ID
+history stopping. Failed details are retained in per-scope checkpoint state
+and retried before newly discovered links; durable file failures remain in
+the generic RecoveryStore. A generic `checkpoint_after_scope` hook allows
+zero-record state updates while preserving post-Catalog checkpoint ordering.
+
+Focused tests `72 passed`; full unit `669 passed`. Real durable smoke stored
+`news_baseline_complete=false`, `pending_news_count=0`, and an empty pending
+list with checkpoint complete and generic recovery pending 0.
+
+## J9 browser worker pool and ProxyPool production wiring
+
+Completed on 2026-09-08. Browser settings and multiple proxy endpoints load
+from generic config. AppFactory creates the pool for browser-capable plugins;
+Bootstrap starts it after recovery and closes it on completion/failure.
+Proxy selection, success/failure reporting, cooldown, isolated profiles and
+recycling remain generic. Real AppFactory forum durable smoke passed with one
+record and pending 0. Focused `63 passed`; full unit `670 passed`.
+
+## J10 dataset-specific browser concurrency/backpressure
+
+Completed on 2026-09-08. Generic browser leases support named bounded budgets
+for instrument discovery, forum, news list and news detail while retaining the
+global worker bound. Toss clients select those generic channels. Existing
+ConcurrentProductionRuntime queues continue to bound record/upload/catalog
+stages. Focused `59 passed`; full unit `671 passed`.
+
+## J11 one-stock real production smoke
+
+Completed on 2026-09-08 with `XKRX:005930` / `A005930`. The real production
+CLI ran `forum_post`, `news_article`, and `news_instrument` through Playwright,
+CanonicalRecord, bounded ConcurrentProductionRuntime queues, Parquet, rsync
+upload/verification, PostgreSQL Catalog and record index, SeenStore and scope
+checkpoint. The three runs wrote, uploaded, verified and registered one file
+each with zero pipeline errors.
+
+Read-only Catalog/NAS query smoke returned 4 forum rows and 7 instrument-
+matched rows from each news dataset. Final recovery-only reported
+`attempted=0`, `remaining_pending=0`, and `terminal_failed=0`. Focused tests:
+`70 passed`; full unit suite: `671 passed`.
+
+## J12 four-stock concurrent production smoke
+
+Completed on 2026-09-08 from the first four canonical IDs in the frozen
+2427-instrument snapshot. Canonical snapshot input now maps correctly to Toss
+`A*` source keys. Real forum smoke crawled 21 records; news article smoke
+crawled 28 records; browser leases reached the configured global maximum of
+2 with no lease failures or profile collisions.
+
+Production intervals prove overlap: news upload began while later scopes were
+still crawling, and Catalog registration overlapped both. The stable list-only
+`news_instrument` path avoids duplicate detail fetches, and an immediate
+36-record repeat wrote zero files. Generic remote compaction materialization
+was fixed to use the Catalog resolver; the final active relation view contains
+48 unique record UIDs in 4 files. Final recovery pending is zero. Focused tests:
+`63 passed`; full unit suite: `677 passed`.
+
+## J13 twenty-stock production smoke
+
+Completed on 2026-09-08 using the frozen snapshot prefix. Real production
+results were forum `107`, news article `180`, and news relation `180` records,
+with 20/20 scopes completed and no browser lease failures. Browser concurrency
+reached 4; news list/detail each reached their configured budget of 4. Peak RSS
+was about 554 MB for forum, 763 MB for article, and 722 MB for relation, with
+zero swap. Queue depths remained within configured bounds and recovery pending
+was zero. A 20-instrument read-only query hit 20 active relation Parquet files
+and returned 192 accumulated unique relations. Focused `63 passed`; full unit
+`677 passed`.
+
+## J14 one-hundred-stock production rollout
+
+Completed on 2026-09-08 using the first 100 canonical IDs from the same frozen
+2427-instrument snapshot. All 100 scopes completed for each production dataset:
+forum crawled 550 records and durably registered 197 files; article crawled 900
+records and registered 236 files; relation crawled 900 records and registered
+82 files. Browser concurrency reached 4 with no lease failures. The forum run
+observed upload-queue backpressure (`68` blocked puts), while every measured
+queue depth remained within its configured bound.
+
+All article and relation checkpoints reported zero pending news. Recovery-only
+reported `remaining=0` and `terminal_failed=0`. A read-only PostgreSQL
+Catalog/NAS query for `XKRX:005930` read 2 active relation Parquet files and
+returned 25 rows. Peak RSS was about 547 MB for forum and 791 MB for relation,
+with no swap. Focused tests: `74 passed`; full unit suite: `677 passed`.
+
+## J15 full Toss KR universe rollout
+
+Completed on 2026-09-09 from the unchanged authoritative
+`config/universes/tossinvest_kr_rollout_universe.txt` snapshot (`2427`
+instruments). The interrupted run resumed from existing checkpoints; no
+durably completed prefix was cleared or regenerated.
+
+```text
+forum_post checkpoints       2427/2427
+news_article checkpoints     2427/2427
+news_instrument checkpoints  2427/2427
+pending news scopes          0
+recovery remaining/failed    0/0
+```
+
+All resumed article and relation segment manifests report `success=true` and
+none failed. PostgreSQL and NAS match on all `23349` Toss Parquet paths with
+zero missing, orphaned, or size-mismatched files. All active Catalog files are
+uploaded: forum `9458`, article `12706`, relation `1158`.
+
+A real read-only query for `XKRX:005930` returned three forum records from NAS
+through the PostgreSQL Catalog in 1.72 seconds. Bounded upload queues reached
+their configured capacity during rollout and drained successfully. Focused
+tests: `99 passed`; full unit suite: `684 passed`.
+
+## J16 one-click Toss profiles
+
+Completed on 2026-09-09. The production CLI now provides `toss_incremental`
+and `toss_full`, both defaulting to the frozen 2427-instrument Toss universe
+and all three Toss datasets. Incremental mode preserves a completed per-scope
+news baseline and pending-detail resume semantics. Full mode disables history
+early-stop while retaining safe one-round forum/news bounds. Explicit CLI
+dataset, instrument, mode, and page limits override profile defaults.
+
+The optional `toss_historical_backfill` profile is also available without
+implicit page bounds; it is intentionally separate from safe `toss_full` and
+has not been represented as a completed full-history production run.
+
+Real Samsung production smokes for both required profiles each crawled and
+normalized forum/article/relation `3/9/9` rows through the generic concurrent
+runtime. Each wrote, uploaded, and Catalog-registered three Parquet files with
+zero pipeline errors and zero pending recovery. Focused tests: `113 passed`;
+full unit suite: `691 passed`.
+
+# Kabutan guidance for finished.md
+
+Do NOT mark Kabutan production crawling as finished at Phase K start.
+
+The only initial completed fact is:
+
+```text
+A user-supplied standalone reference crawler exists and proves Kabutan-specific
+list/detail/pagination behavior.
+```
+
+This does not count as framework production support.
+
+After each accepted K item, append only proven facts.
+
+## K0 Kabutan repository and legacy audit
+
+Completed on 2026-09-10. The standalone `get_all.py` proves the Kabutan list,
+detail, monthly pagination, Japanese header, retry, and repeated-page site
+knowledge described by the integration plan. The target framework currently
+has no Kabutan registration or production implementation. Generic durable
+runtime/storage/recovery/query components are reusable; generic HTTP
+production composition still needs K6 work. Baseline: `691 passed`.
+
+## K1 Kabutan site registration
+
+Completed on 2026-09-10. Added the `kabutan` builtin package and registry
+entry with `country=JP`, `timezone=Asia/Tokyo`, and only
+`dataset=news_article`. The package is disabled by default and deliberately
+does not claim parsing or production HTTP support yet. Focused: `4 passed`;
+full unit: `693 passed`.
+
+## K2 Kabutan list parsing and stable identity
+
+Completed on 2026-09-10. The framework now parses `table.s_news_list`,
+`td.news_time`, plausible categories, and the first `n\d{12}` article link,
+while de-duplicating repeated tables by Kabutan `news_id`. Kabutan records keep
+their month scope but use a global logical identity boundary, so page/month do
+not alter the record identity. No real HTTP claim yet. Focused: `12 passed`;
+full unit: `698 passed`.
+
+## K3 Kabutan article detail parsing
+
+Completed on 2026-09-10. Added detail parsing for `article`, `h1`,
+`time.s_news_date`, fallback `time[datetime]`, category fallback, and cleaned
+`div.body` content. Invalid/missing detail datetime remains absent rather than
+being guessed from list time; missing article/body is explicitly represented
+for later failure handling. No real HTTP claim yet. Focused: `11 passed`; full
+unit: `703 passed`.
+
+## K4 Kabutan month discovery
+
+Completed on 2026-09-10. Month scopes are stable, inclusive, instrument-free,
+and use `scope_id=YYYY-MM` plus `source_key=YYYYMM`. Full history begins at
+2013-09; incremental discovery dynamically includes the Tokyo current month
+and configured prior-month overlap. Focused: `16 passed`; full unit:
+`708 passed`.
+
+## K5 Kabutan protected pagination
+
+Completed on 2026-09-10. Added page-streaming pagination with empty-page,
+repeated-signature, and repeated-ID-subset termination before detail fetches.
+The max-page guard records `safety_capped` and never natural completion. No
+real HTTP claim yet. Focused: `20 passed`; full unit: `712 passed`.
+
+## K6 Generic HTTP production wiring for Kabutan
+
+Completed on 2026-09-10. AppFactory now composes HTTP-required plugins through
+the existing generic transport boundary using a standard-library requester,
+ProxyPool, AdaptiveRateLimiter, and configurable retries for
+429/500/502/503/504. Kabutan contributes only its URL, query parameters, and
+Japanese headers. Real-site acceptance remains K10. Focused: `65 passed`;
+full unit: `715 passed`.
+
+## K7 Kabutan durable month checkpoint semantics
+
+Completed on 2026-09-10. Month state now records year, month, last completed
+page, last news ID, completion, and stop reason. The plugin supplies only a
+candidate checkpoint; generic Runtime persists it after the durable barrier.
+Failures remain incomplete and resume starts at the next durable page. No
+site-owned recovery store was added. Focused: `47 passed`; full unit:
+`717 passed`.
+
+## K8 Kabutan CLI and profiles
+
+Completed on 2026-09-10 and amended on 2026-09-11. Added
+`kabutan_incremental` and `kabutan_free_full`; `kabutan_full` is a compatibility
+alias for free-full semantics. Both support
+validated start/end month, overlap, and per-month safety-cap overrides.
+Profiles select only `news_article`, enable run manifests, and never require an
+instrument or universe file. Real one-click acceptance remains K14. Focused:
+`114 passed`; full unit: `721 passed`.
+
+## K9 Kabutan manifest and completeness audit
+
+Completed on 2026-09-10. Run manifests freeze the exact ordered month scope
+plan. The generic rollout audit now evaluates Kabutan by expected month and
+requires `month_complete=true`; a partial safety-cap checkpoint cannot pass by
+merely existing. Focused: `85 passed`; full unit: `723 passed`.
+
+## K10 Kabutan real read-only HTTP smoke
+
+Completed on 2026-09-10. The generic production HTTP stack fetched real
+Kabutan current-month page 1 (15 items) and detail `n202609100904` (valid
+article/body/detail datetime; 4,748 content chars). The real page omits
+`<tbody>`, unlike lxml-normalized legacy DOM, so the parser now supports both
+shapes. This was read-only and does not yet prove durable production storage.
+Focused: `22 passed`; full unit: `724 passed`.
+
+## K11 free-access durable production acceptance
+
+The 2026-08/09 runs proved real HTTP through the generic durable pipeline,
+interruption-safe resume, SeenStore de-duplication, Parquet upload, PostgreSQL
+Catalog/index, checkpoint/recovery, and Query Layer behavior. They produced 30
+active/uploaded files and 9,362 rows with no pending recovery.
+
+Accepted on 2026-09-11 against the current free range. Real HTTP produced 30
+normalized public articles, one coalesced Parquet file, one NAS upload, and one
+Catalog/index job with zero pipeline errors or pending recovery. The checkpoint
+ended at the public boundary (`free_access_complete=true`), and Query Layer
+returned all 30 records for the Tokyo local date with real detail content and
+source URLs.
+
+## K12 free-access interruption/resume/dedup acceptance
+
+Accepted on 2026-09-11. A production incremental run was interrupted during
+HTTP crawl, recovery-only returned zero pending/failed manifests, and the
+subsequent repeated run completed without writing, uploading, or cataloging a
+duplicate file. The earlier durable 2026-08/09 runs also remain valid evidence
+for batch resume and SeenStore identity de-duplication; they are not claims of
+Premium history completeness.
+
+## Kabutan remote-access control handling
+
+Completed on 2026-09-11. Verified AWS WAF responses now raise the explicit
+`KabutanWafBlockedError` only for HTTP 405 plus Human Verification and AWS body
+markers. Free-full preflight aborts before scope discovery or durable writes,
+does not advance checkpoint/free-access completion, and performs no in-run WAF
+retry. `scripts/probe_kabutan_access.py` provides a secret-free, one-request
+manual AVAILABLE/WAF_BLOCKED check. This does not complete K13 while remote
+access remains blocked. Focused: `48 passed`; full unit: `747 passed`.
+
+After K14, a final section may state:
+
+```text
+Kabutan Market News production integration COMPLETE
+
+site=kabutan
+country=JP
+timezone=Asia/Tokyo
+dataset=news_article
+scope=month
+
+real list HTTP        YES
+real detail HTTP      YES
+monthly pagination    YES
+repeat-page guard     YES
+checkpoint/recovery   YES
+Parquet/upload        YES
+Catalog/index         YES
+query                 YES
+kabutan_incremental   YES
+kabutan_free_full     YES
+Premium history       NOT INCLUDED
+```
+
+
+# Phase L guidance for finished.md
+
+Do NOT mark HKEX financial-report integration complete at Phase L start.
+
+At L0, the only source-backed fact is:
+
+```text
+A standalone HKEX reference implementation exists and proves:
+- exact stock-code -> stockId lookup;
+- report type codes 40100/40200/40300;
+- HKEX title search;
+- PDF URL/result metadata parsing;
+- conservative retry behavior;
+- PDF magic validation;
+- local interruption resume.
+```
+
+This is reference knowledge only, not current framework production support.
+
+After each accepted L item, append only what current code/tests/real production
+have actually proven.
+
+## L0 repository audit and legacy traceability
+
+Completed on 2026-09-11. The supplied
+`../finance_report/hk/get_all_finance_report.py` was traced function by
+function against the current dataset, plugin, HTTP, attachment, durable
+runtime, recovery, Catalog/index, manifest/completeness, and query APIs.
+
+The audit proves only reusable source knowledge: exact five-digit HKEX prefix
+matching, report codes `40100/40200/40300`, title-search parameters, PDF result
+parsing, conservative HTTP retry, PDF magic validation, and interruption
+resume behavior. It does not claim current HKEX production support. Legacy
+CSV output, local PDF layout, failed CSV, completed-URL cache, and progress
+JSON are deliberately excluded from migration. Focused architecture tests:
+`47 passed`; full unit baseline: `747 passed`.
+
+## L1 generic financial-report dataset contract
+
+Completed on 2026-09-11. Added registered, cross-site
+`financial_report` (versioned metadata) and
+`financial_report_instrument` (immutable relation) datasets. Both use the
+existing canonical Arrow schema, Parquet writer, Catalog/index, and query
+machinery. The existing generic `attachment` contract remains the physical
+binary boundary. This is schema acceptance only, not HKEX site acceptance.
+Focused tests: `67 passed`; full unit: `753 passed`.
+
+## L2 HKEXnews package and builtin registration
+
+Completed on 2026-09-11. Added the disabled-by-default `hkexnews` site package,
+manifest, plugin skeleton, and idempotent builtin registration with
+`country=HK`, `timezone=Asia/Hong_Kong`, and the two logical financial-report
+datasets. Unimplemented source operations fail explicitly, so this milestone
+does not claim real discovery, parsing, or HTTP support. Focused: `30 passed`;
+full unit: `757 passed`.
+
+## L3 exact HKEX stockId resolution
+
+Completed on 2026-09-11 with deterministic tests. Added five-digit stock-code
+normalization, canonical `XHKG:` IDs, strict JSONP parsing, and a transport-
+injected `resolve_stock()` that accepts only an exact normalized code match.
+The first autocomplete suggestion is never trusted. Focused: `28 passed`;
+full unit: `770 passed`. Real endpoint proof remains L12.
+
+## L4 HKEX report-search requests
+
+Completed on 2026-09-11 with deterministic transport tests. The generic HTTP
+request contract now supports POST form bodies, and the HKEX client emits the
+verified title-search form for `40100` annual, `40200` interim, and `40300`
+quarterly reports with validated configurable date bounds. No parser or real
+HTTP result is claimed here. Focused: `34 passed`; full unit: `778 passed`.
+
+## L5 HKEX report-result parser and taxonomy
+
+Completed on 2026-09-11 with deterministic HTML tests. The parser accepts
+PDFs only from result rows, canonicalizes and deduplicates HKEX URLs, extracts
+release/code/name fields, prefers the complete final-cell document title, and
+retains annual/interim/quarterly native codes. Cross-category duplicate PDFs
+remain one candidate. Focused: `39 passed`; full unit: `783 passed`; real DOM
+acceptance remains L12.
+
+## L6 HKEX release-time normalization
+
+Completed on 2026-09-11. Source-observed Chinese, slash-date, and compact
+date-time values normalize from Asia/Hong_Kong to aware UTC. Missing,
+date-only, unknown, and invalid values remain null; midnight is never invented.
+Focused: `41 passed`; full unit: `793 passed`.
+
+## L7 canonical financial-report normalization
+
+Completed on 2026-09-11. HKEX result rows normalize to versioned
+`financial_report` records and immutable `financial_report_instrument`
+relations. Canonical PDF URL SHA-256 is the conservative source identity;
+operational instrument scope does not alter logical identity. Source/scope
+instrument mismatches fail, and unproven language/fiscal fields remain null.
+Focused: `74 passed`; full unit: `798 passed`.
+
+## L8 generic PDF attachment integration
+
+Completed on 2026-09-11. HKEX logical reports now produce parent-linked generic
+attachment requests and consume the existing downloader/store/uploader result;
+no HKEX-specific binary path or uploader was added. Generic PDF validation was
+strengthened to require `%PDF-` magic despite MIME claims, allow source-specific
+minimum size, and atomically finalize local files. Focused: `89 passed`; full
+unit: `801 passed`. Real PDF/NAS acceptance remains L13.
+
+## L9 HKEX checkpoint and recovery semantics
+
+Completed on 2026-09-11 with deterministic failure/resume tests. Instrument
+scope state is keyed by a request signature covering dataset, instrument,
+report types, and date range. A complete candidate exists only after search or
+attachment work naturally finishes; exceptions leave the accepted checkpoint
+unchanged. Full mode resumes matching durable scopes, while changed inputs do
+not get skipped. Generic Runtime/RecoveryStore retain persistence ownership.
+Focused: `98 passed`; full unit: `805 passed`.
+
+## L10 HKEX CLI, profiles, and production composition
+
+Completed on 2026-09-11 without real HTTP. Added `hkex_reports_incremental`
+and `hkex_reports_full`, report type/date/lookback/PDF controls, canonical
+instrument discovery, and AppFactory wiring into the generic concurrent HTTP
+runtime and attachment pipeline. A deterministic 2,798-instrument XHKG
+snapshot was generated from the supplied CSV in stable row order with source
+SHA metadata. Focused: `156 passed`; full unit: `814 passed`. Production
+acceptance remains L12-L18.
+
+## L11 deterministic HKEX acceptance matrix
+
+Completed on 2026-09-11. The focused matrix covers annual/interim/quarterly
+taxonomy, exact prefix collisions and malformed stock IDs, all verified/null
+release-time cases, canonical report identity, cross-category identity,
+HTML-as-PDF rejection, size/magic/atomic attachment handling, profiles, and
+production composition. Focused: `200 passed`; full unit: `820 passed`. These
+tests do not substitute for L12 real HTTP.
+
+## L12 one-instrument real read-only HTTP smoke
+
+Completed on 2026-09-11. The real generic HTTP client resolved
+`XHKG:00005` to HKEX `stockId=5` (`HSBC HOLDINGS`) and found three annual
+reports since 2024. The first real row produced a canonical report UID and
+`2026-03-26T23:30:00Z` event time. The smoke exposed and fixed real cell labels
+(`Release Time`, `Stock Code`, `Stock Short Name`, `Document`) before canonical
+normalization. No PDF or durable state was written. Focused: `58 passed`; full
+unit: `821 passed`.
+
+## L13 one-instrument durable metadata and PDF smoke
+
+Completed on 2026-09-11 for `XHKG:00005`, annual, March 2026. Real metadata,
+relation, and attachment datasets each produced one new canonical row and one
+Parquet file, NAS upload/verification, and Catalog/index registration with zero
+pipeline errors. All three checkpoints completed; recovery-only found zero
+pending/failed work. Query Layer read the report and parent-linked attachment;
+the PDF SHA was recorded and its 12,588,090-byte NAS object matched metadata.
+Focused: `144 passed`; full unit: `821 passed`.
+
+## L14 ten-instrument mixed report-type acceptance
+
+Completed on 2026-09-11 and audited on 2026-09-15. Ten consecutive instruments
+from the snapshot's first GEM segment completed metadata and relation durable
+flows: 425 records per dataset, 10/10 scopes, zero UID duplicates, zero errors,
+and zero recovery pending. Catalog/NAS Query returned annual=123, interim=119,
+and quarterly=183. Focused: `140 passed`; full unit: `821 passed`.
+
+This acceptance also measured a non-correctness performance defect: 425 report
+rows occupied 425 event-day Parquet files, making remote materialization take
+696.34 seconds while scanning took 1.12 seconds. L15 must prevent this pattern
+for future runs before expansion; no existing NAS file is modified by that fix.
+
+## L15 financial-report interruption/resume/dedup acceptance
+
+Completed on 2026-09-15 using three consecutive authoritative snapshot entries
+at offset 2369. Financial-report metadata and relation datasets now opt into a
+generic yearly, single-bucket partition policy; all other datasets retain their
+existing partition defaults. The interrupted run durably completed metadata
+but not relations, recovery-only was clean, and the exact resume skipped all
+three metadata scopes before completing the remaining relations. The final
+identical rerun produced zero crawled records and zero new files.
+
+The new metadata packaging stored 120 reports in 13 yearly Parquet files,
+compared with the prior one-file-per-report behavior; 120 relations were stored
+in one file. Existing L13/L14 NAS objects were not modified or compacted.
+Focused: `183 passed`; the pre-acceptance full suite passed `823` tests.
+
+## L16 100-instrument HKEX production rollout
+
+Completed on 2026-09-15 for the first 100 canonical instruments in the
+2,798-entry snapshot. Production CLI discovery completed 200 dataset scopes
+and found 3,663 report rows plus 3,663 relation rows. Existing durable state
+accounted for 479 metadata and one relation; the append-only run wrote 3,184
+metadata rows in 20 yearly files and 3,662 relations in one file. All 21 files
+were uploaded and cataloged with zero pipeline errors and zero recovery
+pending. Direct NAS materialization verified every file's size and SHA256.
+
+Real rollout findings were fixed and regression-tested: unavailable exact
+stock matches become durable empty scopes without hiding HTTP/parser failures,
+and explicit HKEX dual-counter code fields are validated as a set. Query
+partition pruning now reads the same DatasetSpec bucket policy as the writer,
+includes declared legacy 256-bucket files, and expands yearly date pruning to
+the partition boundary. Both new `XHKG:00016` data and old `XHKG:08003`
+relations were read through PostgreSQL Catalog/NAS. Focused: `110 passed`;
+full unit: `831 passed`.
+
+## L17 full configured HK universe rollout
+
+Completed on 2026-09-16 by resuming the interrupted append-only run from its
+existing checkpoints. All 2,798 canonical instruments completed both
+`financial_report` and `financial_report_instrument`, for 5,596/5,596 durable
+scopes with zero failed, partial, or missing scopes. The resume crawled 53,657
+relation rows; SeenStore retained 53,079 new rows in five coalesced Parquet
+files and deduplicated 578 existing rows. All five files were uploaded and
+Cataloged, and their NAS sizes and SHA256 values match Catalog. Final
+recovery-only reported zero pending and terminal-failed work.
+
+The interrupted run exposed a generic async transport bug: adaptive limiter
+delays used synchronous `time.sleep` inside `HttpTransport`. The limiter now
+exposes a non-blocking delay calculation and the async transport awaits its
+configured sleep, while the synchronous compatibility API remains available.
+
+## L18 profiles, query, and completeness acceptance
+
+Completed on 2026-09-16. Completeness now treats both financial-report
+datasets as instrument-scoped and reports `expected_scopes=5596`,
+`completed_scopes=5596`, and zero missing/failed/partial scopes. A real
+`hkex_reports_incremental` run completed HTTP discovery, normalization,
+SeenStore dedup, and checkpoints. A subsequent full-snapshot
+`hkex_reports_full` run skipped every matching durable scope and produced zero
+records/files. Query Layer read real report metadata and instrument relations
+through PostgreSQL Catalog/NAS. Final focused tests: `232 passed`; full unit:
+`837 passed`.
+
+```text
+HKEX Financial Reports production integration COMPLETE
+
+site=hkexnews
+country=HK
+datasets:
+  financial_report
+  financial_report_instrument
+  attachment
+
+annual discovery          YES
+interim discovery         YES
+quarterly discovery       YES
+exact stockId resolution  YES
+stable report identity    YES
+release-time normalization YES
+PDF validation/SHA        YES
+Parquet/NAS               YES
+Catalog/index             YES
+Seen/checkpoint/recovery   YES
+query                     YES
+hkex_reports_incremental  YES
+hkex_reports_full         YES
+```
+
+## M0 Production orchestration audit
+
+Completed on 2026-09-16 without running a production crawl or mutating durable
+state. The audit traced CLI -> AppFactory -> CrawlBootstrap -> startup recovery
+-> ConcurrentProductionRuntime -> StoragePipeline and inspected all current
+single-site profiles.
+
+Confirmed existing foundations:
+
+```text
+startup recovery before crawl                  YES
+bounded record/upload/catalog queues           YES
+write/upload/verify/Catalog/Seen ordering       YES
+scope checkpoint after associated batches      YES
+unchanged replay suppressed by SeenStore        YES
+Catalog file-path registration idempotent       YES
+single-site production profiles                 YES
+basic non-interactive progress snapshots        YES
+```
+
+M0 is an audit completion only. ResumePlanner, restart-aware progress,
+graceful interruption, global profiles, shared cross-site budgets, and a
+platform manifest remain Phase M work and are not claimed complete here.
+Focused architecture/recovery tests: `178 passed`; full unit suite:
+`837 passed`.
+
+## M1 Generic ResumePlanner / ResumePlan
+
+Completed on 2026-09-16. Added a generic read-only planning model for:
+
+```text
+DURABLE_COMPLETE
+RECOVERY_PENDING
+INCOMPLETE
+BLOCKED
+FAILED_RETRYABLE
+FAILED_TERMINAL
+```
+
+The planner consumes explicit evidence instead of interpreting opaque site
+checkpoint fields. It provides stable aggregate counts, ordered serialization,
+duplicate-scope rejection, and a crawlable-scope view. The checkpoint adapter
+only calls `exists()`/`load()` and delegates completion/recovery/blocking
+semantics to read-only callbacks. Production startup integration is M2.
+Focused: `71 passed`; full unit: `847 passed`.
+
+## M2 Recovery-first startup integration
+
+Completed on 2026-09-16. The real AppFactory concurrent runtime now receives a
+ResumePlanner. Startup order is:
+
+```text
+RecoveryOrchestrator
+-> managed resources/runtime discovery
+-> load post-recovery checkpoints
+-> build ResumePlan
+-> skip proven DURABLE_COMPLETE scopes before plugin.crawl
+-> crawl remaining scopes
+```
+
+The runtime includes per-dataset resume plans in its result/run-manifest data.
+Skipped durable scopes retain zero-work scope results without checkpoint
+rewrites. Existing HKEX full-signature and Kabutan old-month completion rules
+were moved behind the generic plugin hook without changing their semantics.
+Focused: `100 passed`; full unit: `851 passed`. No production crawl or
+durable-state mutation was used for M2 acceptance.
+
+## M3 Resumable durable-stage classification
+
+Completed on 2026-09-16. New recovery manifests persist sorted, deduplicated
+scope tokens from their exact FlushBatch. Resume planning can therefore map
+scope-owned manifests to:
+
+```text
+local                 -> UPLOAD_AND_VERIFY
+uploaded              -> VERIFY_REMOTE
+verified              -> REGISTER_CATALOG
+catalog_registered    -> COMMIT_SEEN
+seen_committed         -> ADVANCE_CHECKPOINT_MARKER
+checkpoint_committed  -> CLEAN_LOCAL
+cleanable             -> CLEAN_LOCAL
+deleted               -> NONE
+```
+
+Retryable and terminal failures map to their corresponding ResumePlan states.
+`LocalUploader` and `RsyncUploader` now implement verify-existing without data
+transfer. Recovery from `uploaded` requires manifest `remote_path` and explicit
+size/SHA verification policy, then proceeds without calling `upload()`.
+Legacy manifests without scope tokens are never assigned by filename.
+Focused: `149 passed`; full unit: `864 passed`.
+
+## M4 ProgressAggregator
+
+Completed on 2026-09-16. Added a thread-safe, renderer-independent progress
+model under `observability/progress.py`. It aggregates:
+
+```text
+platform -> site -> dataset -> scopes
+records: crawled/normalized/new/unchanged/updated/failed
+storage: buffered/prepared/written/uploaded/verified/cataloged/compacted
+queues: current and observed maximum depth
+recovery: pending/attempted/recovered/retryable/terminal
+performance: rates and crawl/write/upload/catalog busy time
+```
+
+ResumePlan seeds durable completion and checkpoint skips before runtime work,
+so a 5-of-10 restart snapshot begins at 50%. Percentages are clamped to
+0..100, completion is idempotently capped, ETA appears only after session work
+provides a rate, and snapshots serialize cleanly to JSON. The production
+runtime emits events and includes final aggregated progress in its result.
+Focused: `69 passed`; full unit: `872 passed`.
+
+## M5 Rich/Text progress dashboard
+
+Completed on 2026-09-16. Added optional Rich Live and plain-text production
+renderers over the M4 snapshots. Selection policy:
+
+```text
+auto + TTY + Rich installed  -> Rich Live
+auto + non-TTY/log           -> periodic text
+Rich requested but missing   -> text fallback
+--no-progress                -> disabled
+--json                       -> disabled, clean machine stdout
+```
+
+Both renderers show platform/site/dataset scope progress and expose resume
+skips, blocked/failed state, records, storage stages, queues, recovery, rates,
+and busy times. Runtime emits a final snapshot and closes the renderer even
+through its outer cleanup path. Rich remains optional and was real-rendered in
+the current `pac` environment. Focused: `130 passed`; full unit:
+`881 passed`.
+
+## M6 Graceful Ctrl-C resume
+
+Completed on 2026-09-16. Production CLI and ConcurrentProductionRuntime now
+share a generic two-stage ShutdownController:
+
+```text
+first Ctrl-C  -> stop discovery/new scope intake, drain write/upload/Catalog
+second Ctrl-C -> cancel and await all workers, preserve durable/recovery state
+```
+
+An interrupted in-flight scope flushes records already accepted by the bounded
+pipeline but does not call `checkpoint_after_scope`, so it cannot be falsely
+marked whole-scope complete. Record-level checkpoint progress advances only
+after the associated batches cross the existing durable barrier. Forced abort
+skips end-of-run buffer work, leaves replayable state intact, gathers all
+tasks, closes the progress renderer, and emits an interrupted runtime result.
+Bootstrap maps that result to unsuccessful/resumable completion; CLI writes an
+enabled run manifest and exits with code `130`. No site adapter contains signal
+or queue logic. Focused: `144 passed`; full unit: `888 passed`. No production
+crawl or durable production mutation was used for M6 acceptance.
+
+## M7 Global profiles/orchestrator
+
+Completed on 2026-09-17. Added the one-command platform entry and official
+profile mappings:
+
+```text
+global_full:
+  naver_finance -> naver_full
+  tossinvest    -> toss_full
+  kabutan       -> kabutan_free_full
+  hkexnews      -> hkex_reports_full
+
+global_incremental:
+  naver_finance -> naver_incremental
+  tossinvest    -> toss_incremental
+  kabutan       -> kabutan_incremental
+  hkexnews      -> hkex_reports_incremental
+```
+
+The generic PlatformOrchestrator runs the existing AppFactory/Bootstrap path in
+stable order, isolates site failures, shares the M6 shutdown controller, and
+supports platform recovery-only operation. Kabutan performs one real access
+probe before its Bootstrap; verified WAF Human Verification becomes a
+non-fatal `BLOCKED` site and later sites continue. JSON output is clean and
+machine-readable. Named production profiles now always select the bounded
+ConcurrentProductionRuntime even when conservative configuration gives every
+stage one worker. Cross-site parallelism and shared stage budgets remain M8.
+Focused: `148 passed`; full unit: `899 passed`. No production crawl ran.
+
+## M8 Global resource budgets
+
+Completed on 2026-09-17. `run-platform` now supports:
+
+```text
+--site-workers N
+--global-writer-workers N
+--global-upload-workers N
+--global-catalog-workers N
+```
+
+Defaults are `2/2/2/2`; global upload concurrency is rejected above 4. Sites
+run concurrently in one process while retaining their own crawl, browser, HTTP
+and rate-limit settings. A shared observable GlobalStageBudget gates actual
+Parquet preparation, upload/verification, Catalog/index/Seen/checkpoint work,
+startup recovery, attachment store/upload, end flush, and post-dataset
+compaction. It reports limit, current active, observed maximum, and waits for
+each durable stage. First/second Ctrl-C still uses the shared M6 controller and
+awaits all site/runtime tasks. Focused: `173 passed`; full unit: `907 passed`.
+No production crawl or durable-state mutation was used for M8 acceptance.
+
+## M9 Global run manifest
+
+Completed on 2026-09-17. Every `run-platform` invocation now writes one atomic
+aggregate JSON manifest before returning, including controlled exit code 130
+interrupts and runs containing blocked or failed sites. The default location
+is:
+
+```text
+state/run_manifests/platform_<profile>_<timestamp>.json
+```
+
+The manifest records platform run ID, profile and timestamps, final state,
+site profiles, datasets, reproducible universe path/hash/count metadata,
+per-site ResumePlans, scope/record/file/upload/Catalog counters, startup
+recovery totals, shared resource-budget observations, blocked/failed sites,
+errors, and each site's serialized runtime evidence. `--run-manifest-path`
+provides an explicit destination. The orchestrator and manifest share the same
+parsed site options, and the writer uses a same-directory temporary file plus
+atomic replace; the existing single-site writer now uses the same primitive.
+Focused: `193 passed`; full unit: `914 passed`. No production crawl or
+durable-state mutation was used for M9 acceptance.
+
+## M10 Deterministic resume/progress matrix
+
+Completed on 2026-09-17 without production data mutation. Added a concentrated
+acceptance matrix that executes the real ResumePlanner,
+ConcurrentProductionRuntime, FileCheckpointStore, ProgressAggregator, bounded
+writer/upload/Catalog stages, and ShutdownController. Covered states:
+
+```text
+cold / 50% partial / 100% complete restart
+DURABLE_COMPLETE / RECOVERY_PENDING / INCOMPLETE / BLOCKED
+FAILED_RETRYABLE / FAILED_TERMINAL
+zero-record durable scope
+unchanged replay with zero new durable work
+attachment dataset and compaction metrics
+first-interrupt incomplete-scope preservation
+TTY Rich / non-TTY text / JSON-disabled progress paths
+all persisted recovery-stage next actions
+```
+
+A profile whose three scopes are checkpoint-complete performs zero crawler
+calls, zero record submissions, zero Parquet writes, zero uploads, and zero
+Catalog jobs while progress starts and remains at 100%. An unchanged replay
+advances safe scope completion but creates no durable file. Existing focused
+tests supply the real SeenStore/StoragePipeline and RecoveryManager evidence
+behind those runtime matrix cases. Focused: `249 passed`; full unit:
+`923 passed`.
+
+## M11 Interrupted small global smoke
+
+Completed on 2026-09-17 with the real production CLI and existing durable
+state. Command shape:
+
+```text
+run-platform --profile global_incremental --instrument-limit 2
+--site-workers 4 --global-writer-workers 2
+--global-upload-workers 2 --global-catalog-workers 2
+--coalesce-scope-flushes
+```
+
+The deterministic prefixes were Naver/Toss `005930,000660` and HKEX
+`00001,00002`; Kabutan used its one-request access probe and remained safely
+`BLOCKED` by AWS WAF. A single Ctrl-C stopped new work and drained accepted
+queues. The first attempt found a real integration bug: Playwright driver
+closure during SIGINT was reported as a Toss site failure. The generic runtime
+now treats discovery/crawl transport teardown as interruption only when shared
+shutdown is already requested, and PlatformOrchestrator has the same fallback;
+writer/upload/Catalog errors remain failures.
+
+Final retry evidence:
+
+```text
+platform state        INTERRUPTED
+naver_finance         INTERRUPTED
+tossinvest            INTERRUPTED
+hkexnews              INTERRUPTED
+kabutan               BLOCKED (waf_human_verification)
+failed_sites          0
+pending recovery      0
+pipeline errors       0
+new Parquet files     0
+uploads/Catalog jobs  0/0
+Catalog rows since M11 0
+```
+
+Interrupted Naver checkpoints retained only safe page cursors and no false
+whole-scope marker; a naturally completed HKEX scope retained its valid
+completion checkpoint. Both aggregate manifests were preserved. Focused:
+`113 passed`; full unit: `926 passed`.

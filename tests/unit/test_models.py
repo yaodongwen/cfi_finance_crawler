@@ -77,6 +77,33 @@ def test_record_uid_is_stable():
     )
 
 
+def test_record_identity_scope_can_differ_from_operational_scope():
+    first = CanonicalRecord(
+        site_id="example",
+        country="JP",
+        dataset="news_article",
+        source_id="n123456789012",
+        scope_type="month",
+        scope_id="2026-08",
+        identity_scope_type="global",
+        title="same",
+    )
+    second = CanonicalRecord(
+        site_id="example",
+        country="JP",
+        dataset="news_article",
+        source_id="n123456789012",
+        scope_type="month",
+        scope_id="2026-09",
+        identity_scope_type="global",
+        title="same",
+    )
+
+    assert first.record_uid == second.record_uid
+    assert first.version_hash == second.version_hash
+    assert first.scope_id != second.scope_id
+
+
 def test_different_sites_do_not_conflict():
 
     naver = CanonicalRecord(

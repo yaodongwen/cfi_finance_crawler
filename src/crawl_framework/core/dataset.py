@@ -12,6 +12,8 @@ PartitionTimeField = Literal[
     "crawled_at",
 ]
 
+PartitionTimeGranularity = Literal["day", "month", "year"]
+
 
 @dataclass(
     frozen=True,
@@ -51,6 +53,20 @@ class DatasetSpec:
     allow_missing_content: bool = True
 
     relation_dataset: bool = False
+
+    partition_time_granularity: PartitionTimeGranularity = "day"
+
+    partition_bucket_count: int | None = None
+
+    legacy_partition_bucket_counts: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.partition_time_granularity not in {"day", "month", "year"}:
+            raise ValueError("invalid partition_time_granularity")
+        if self.partition_bucket_count is not None and self.partition_bucket_count < 1:
+            raise ValueError("partition_bucket_count must be positive")
+        if any(count < 1 for count in self.legacy_partition_bucket_counts):
+            raise ValueError("legacy_partition_bucket_counts must be positive")
 
 
 # ============================================================
@@ -129,6 +145,37 @@ RESEARCH_INSTRUMENT = DatasetSpec(
     allow_missing_event_time=True,
     allow_missing_content=True,
     relation_dataset=True,
+)
+
+
+FINANCIAL_REPORT = DatasetSpec(
+    name="financial_report",
+    mutation_policy="versioned",
+    partition_time_field="event_time",
+    default_scope_type="instrument",
+    requires_instrument=True,
+    allows_multiple_instruments=True,
+    allow_missing_event_time=True,
+    allow_missing_content=True,
+    partition_time_granularity="year",
+    partition_bucket_count=1,
+    legacy_partition_bucket_counts=(256,),
+)
+
+
+FINANCIAL_REPORT_INSTRUMENT = DatasetSpec(
+    name="financial_report_instrument",
+    mutation_policy="immutable",
+    partition_time_field="crawled_at",
+    default_scope_type="instrument",
+    requires_instrument=True,
+    allows_multiple_instruments=False,
+    allow_missing_event_time=True,
+    allow_missing_content=True,
+    relation_dataset=True,
+    partition_time_granularity="year",
+    partition_bucket_count=1,
+    legacy_partition_bucket_counts=(256,),
 )
 
 
@@ -234,6 +281,8 @@ DATASETS: dict[
         COMMENT,
         RESEARCH_REPORT,
         RESEARCH_INSTRUMENT,
+        FINANCIAL_REPORT,
+        FINANCIAL_REPORT_INSTRUMENT,
         AUTHOR_PROFILE,
         AUTHOR_POST,
         HOLDING_SNAPSHOT,

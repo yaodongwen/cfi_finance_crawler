@@ -5,6 +5,8 @@ import pytest
 from crawl_framework.sites.naver_finance.research import (
     NaverResearchClient,
     NaverResearchHTTPError,
+    ResearchListItem,
+    build_research_list_signature,
     normalize_categories,
     normalize_research_date,
     parse_research_detail,
@@ -130,6 +132,112 @@ class FakeRateLimiter:
         )
 
 
+def make_research_list_item(
+    report_id,
+    *,
+    category="market",
+    page=1,
+):
+
+    return ResearchListItem(
+        report_type=category,
+        report_id=str(
+            report_id
+        ),
+        title=f"report {report_id}",
+        institution="test",
+        published_at="2026-09-07",
+        views=None,
+        detail_url=(
+            "https://finance.naver.com/"
+            f"research/{category}_read.naver?nid={report_id}"
+        ),
+        list_url=research_list_url(
+            category,
+            page,
+        ),
+        list_page=page,
+    )
+
+
+class PagingResearchClient(
+    NaverResearchClient
+):
+
+    def __init__(
+        self,
+        pages,
+        *,
+        stop_empty_pages=1,
+    ):
+
+        super().__init__(
+            stop_empty_pages=stop_empty_pages,
+            request_delay_seconds=0,
+            verify_ssl=False,
+        )
+
+        self.pages = pages
+
+        self.list_calls = []
+
+        self.detail_calls = []
+
+
+    def fetch_list(
+        self,
+        category,
+        *,
+        page,
+    ):
+
+        self.list_calls.append(
+            (
+                category,
+                page,
+            )
+        )
+
+        return list(
+            self.pages.get(
+                (
+                    category,
+                    page,
+                ),
+                [],
+            )
+        )
+
+
+    def fetch_detail(
+        self,
+        item,
+    ):
+
+        self.detail_calls.append(
+            (
+                item.report_type,
+                item.report_id,
+                item.list_page,
+            )
+        )
+
+        return item.to_raw()
+
+
+async def collect_research_pages(
+    client,
+    **kwargs,
+):
+
+    return [
+        row
+        async for row in client.crawl_pages(
+            **kwargs
+        )
+    ]
+
+
 def test_research_list_url_supports_all_categories():
 
     assert research_list_url(
@@ -165,6 +273,420 @@ def test_research_list_url_supports_all_categories():
         "economy",
         "debenture",
     )
+
+
+def test_build_research_list_signature_uses_report_ids():
+
+    assert build_research_list_signature(
+        [
+            make_research_list_item(
+                " 101 ",
+            ),
+            make_research_list_item(
+                "",
+            ),
+            make_research_list_item(
+                100,
+            ),
+        ]
+    ) == (
+        "101",
+        "100",
+    )
+
+
+def test_crawl_pages_stops_on_empty_page_after_processing_pages():
+
+    client = PagingResearchClient(
+        {
+            (
+                "market",
+                1,
+            ): [
+                make_research_list_item(
+                    101,
+                    page=1,
+                ),
+                make_research_list_item(
+                    100,
+                    page=1,
+                ),
+            ],
+            (
+                "market",
+                2,
+            ): [
+                make_research_list_item(
+                    99,
+                    page=2,
+                ),
+                make_research_list_item(
+                    98,
+                    page=2,
+                ),
+            ],
+            (
+                "market",
+                3,
+            ): [],
+        }
+    )
+
+    import asyncio
+
+    rows = asyncio.run(
+        collect_research_pages(
+            client,
+            categories="market",
+            mode="full",
+            max_pages=10,
+        )
+    )
+
+    assert [
+        row[
+            "report_id"
+        ]
+        for row in rows
+    ] == [
+        "101",
+        "100",
+        "99",
+        "98",
+    ]
+
+    assert client.list_calls == [
+        (
+            "market",
+            1,
+        ),
+        (
+            "market",
+            2,
+        ),
+        (
+            "market",
+            3,
+        ),
+    ]
+
+
+def test_crawl_pages_stops_repeated_final_page_before_fetch_detail():
+
+    client = PagingResearchClient(
+        {
+            (
+                "market",
+                1,
+            ): [
+                make_research_list_item(
+                    101,
+                    page=1,
+                ),
+                make_research_list_item(
+                    100,
+                    page=1,
+                ),
+            ],
+            (
+                "market",
+                2,
+            ): [
+                make_research_list_item(
+                    99,
+                    page=2,
+                ),
+                make_research_list_item(
+                    98,
+                    page=2,
+                ),
+            ],
+            (
+                "market",
+                3,
+            ): [
+                make_research_list_item(
+                    99,
+                    page=3,
+                ),
+                make_research_list_item(
+                    98,
+                    page=3,
+                ),
+            ],
+            (
+                "market",
+                4,
+            ): [
+                make_research_list_item(
+                    99,
+                    page=4,
+                ),
+                make_research_list_item(
+                    98,
+                    page=4,
+                ),
+            ],
+        }
+    )
+
+    import asyncio
+
+    rows = asyncio.run(
+        collect_research_pages(
+            client,
+            categories="market",
+            mode="full",
+            max_pages=10,
+        )
+    )
+
+    assert [
+        row[
+            "report_id"
+        ]
+        for row in rows
+    ] == [
+        "101",
+        "100",
+        "99",
+        "98",
+    ]
+
+    assert client.list_calls == [
+        (
+            "market",
+            1,
+        ),
+        (
+            "market",
+            2,
+        ),
+        (
+            "market",
+            3,
+        ),
+    ]
+
+    assert client.detail_calls == [
+        (
+            "market",
+            "101",
+            1,
+        ),
+        (
+            "market",
+            "100",
+            1,
+        ),
+        (
+            "market",
+            "99",
+            2,
+        ),
+        (
+            "market",
+            "98",
+            2,
+        ),
+    ]
+
+
+def test_crawl_pages_repeated_signature_state_is_per_category():
+
+    client = PagingResearchClient(
+        {
+            (
+                "market",
+                1,
+            ): [
+                make_research_list_item(
+                    101,
+                    category="market",
+                    page=1,
+                ),
+                make_research_list_item(
+                    100,
+                    category="market",
+                    page=1,
+                ),
+            ],
+            (
+                "market",
+                2,
+            ): [],
+            (
+                "company",
+                1,
+            ): [
+                make_research_list_item(
+                    101,
+                    category="company",
+                    page=1,
+                ),
+                make_research_list_item(
+                    100,
+                    category="company",
+                    page=1,
+                ),
+            ],
+            (
+                "company",
+                2,
+            ): [],
+        }
+    )
+
+    import asyncio
+
+    rows = asyncio.run(
+        collect_research_pages(
+            client,
+            categories=(
+                "market",
+                "company",
+            ),
+            mode="full",
+            max_pages=10,
+        )
+    )
+
+    assert [
+        (
+            row[
+                "category"
+            ],
+            row[
+                "report_id"
+            ],
+        )
+        for row in rows
+    ] == [
+        (
+            "market",
+            "101",
+        ),
+        (
+            "market",
+            "100",
+        ),
+        (
+            "company",
+            "101",
+        ),
+        (
+            "company",
+            "100",
+        ),
+    ]
+
+    assert client.list_calls == [
+        (
+            "market",
+            1,
+        ),
+        (
+            "market",
+            2,
+        ),
+        (
+            "company",
+            1,
+        ),
+        (
+            "company",
+            2,
+        ),
+    ]
+
+
+def test_crawl_pages_incremental_existing_pages_stop_still_applies():
+
+    client = PagingResearchClient(
+        {
+            (
+                "market",
+                1,
+            ): [
+                make_research_list_item(
+                    101,
+                    page=1,
+                ),
+                make_research_list_item(
+                    100,
+                    page=1,
+                ),
+            ],
+            (
+                "market",
+                2,
+            ): [
+                make_research_list_item(
+                    99,
+                    page=2,
+                ),
+                make_research_list_item(
+                    98,
+                    page=2,
+                ),
+            ],
+            (
+                "market",
+                3,
+            ): [
+                make_research_list_item(
+                    97,
+                    page=3,
+                ),
+            ],
+            (
+                "market",
+                4,
+            ): [
+                make_research_list_item(
+                    96,
+                    page=4,
+                ),
+            ],
+        }
+    )
+
+    import asyncio
+
+    rows = asyncio.run(
+        collect_research_pages(
+            client,
+            categories="market",
+            mode="incremental",
+            max_pages=10,
+            seen_report_ids={
+                "101",
+                "100",
+                "99",
+                "98",
+                "97",
+            },
+        )
+    )
+
+    assert rows == []
+
+    assert client.detail_calls == []
+
+    assert client.list_calls == [
+        (
+            "market",
+            1,
+        ),
+        (
+            "market",
+            2,
+        ),
+        (
+            "market",
+            3,
+        ),
+    ]
 
 
 def test_normalize_research_date_accepts_legacy_formats():

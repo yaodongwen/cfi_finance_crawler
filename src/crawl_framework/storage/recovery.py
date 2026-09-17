@@ -166,6 +166,8 @@ class RecoveryManifest:
 
     file_size: int
 
+    scope_tokens: tuple[str, ...] = ()
+
     stage: RecoveryStage = "local"
 
     record_index_path: str | None = None
@@ -234,6 +236,21 @@ class RecoveryManifest:
             raise ValueError(
                 "retry_count cannot be negative"
             )
+
+        normalized_scope_tokens = tuple(
+            sorted(
+                {
+                    str(token).strip()
+                    for token in self.scope_tokens
+                    if str(token).strip()
+                }
+            )
+        )
+        object.__setattr__(
+            self,
+            "scope_tokens",
+            normalized_scope_tokens,
+        )
 
         if (
             self.failed_from_stage
@@ -589,6 +606,22 @@ class RecoveryStore:
             in self.list_all()
             if manifest.stage
             == stage
+        ]
+
+    def list_for_scope(
+        self,
+        scope_token: str,
+        *,
+        include_deleted: bool = False,
+    ) -> list[RecoveryManifest]:
+        token = str(scope_token).strip()
+        if not token:
+            raise ValueError("scope_token cannot be empty")
+        return [
+            manifest
+            for manifest in self.list_all()
+            if token in manifest.scope_tokens
+            and (include_deleted or manifest.stage != "deleted")
         ]
 
 
@@ -1054,9 +1087,8 @@ class RecoveryManager:
             → catalog
 
     uploaded:
-        为避免假定远端一定完整，
-        重新执行 uploader.upload()
-        uploader 应保证覆盖/重复上传安全。
+        使用 manifest 的 remote_path + size/hash durable evidence
+        仅验证已存在的远端文件，不重复上传。
 
     verified:
         → register PostgreSQL
@@ -1524,32 +1556,24 @@ class RecoveryManager:
             # =================================================
 
             elif manifest.stage == "uploaded":
-
-                local_path = Path(
-                    manifest.local_path
-                )
-
-                if not local_path.exists():
-
-                    raise RuntimeError(
-                        "cannot verify uploaded manifest: "
-                        "local parquet is missing"
-                    )
-
                 info = (
                     manifest_to_parquet_info(
                         manifest
                     )
                 )
 
-                upload = (
-                    self.uploader.upload(
-                        info
+                remote_path = str(manifest.remote_path or "").strip()
+                if not remote_path:
+                    raise RuntimeError(
+                        "cannot verify uploaded manifest: remote_path is missing"
                     )
+
+                verification = self.uploader.verify_existing(
+                    info,
+                    remote_path=remote_path,
                 )
 
-                if upload.status != "verified":
-
+                if verification.status != "verified":
                     raise RuntimeError(
                         "recovery verification failed"
                     )
@@ -1559,7 +1583,7 @@ class RecoveryManager:
                         manifest.manifest_id,
                         "verified",
                         remote_path=(
-                            upload.remote_path
+                            verification.remote_path
                         ),
                     )
                 )

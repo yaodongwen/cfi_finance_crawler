@@ -99,6 +99,51 @@ def test_relation_dataset():
     )
 
 
+def test_financial_report_contract():
+
+    spec = get_dataset_spec(
+        "financial_report"
+    )
+
+    assert spec.mutation_policy == "versioned"
+    assert spec.partition_time_field == "event_time"
+    assert spec.default_scope_type == "instrument"
+    assert spec.requires_instrument is True
+    assert spec.allows_multiple_instruments is True
+    assert spec.allow_missing_event_time is True
+    assert spec.allow_missing_content is True
+    assert spec.partition_time_granularity == "year"
+    assert spec.partition_bucket_count == 1
+
+
+def test_financial_report_instrument_contract():
+
+    spec = get_dataset_spec(
+        "financial_report_instrument"
+    )
+
+    assert spec.mutation_policy == "immutable"
+    assert spec.partition_time_field == "crawled_at"
+    assert spec.default_scope_type == "instrument"
+    assert spec.requires_instrument is True
+    assert spec.relation_dataset is True
+    assert spec.partition_time_granularity == "year"
+    assert spec.partition_bucket_count == 1
+
+
+def test_attachment_remains_generic_for_financial_reports():
+
+    spec = get_dataset_spec(
+        "attachment"
+    )
+
+    assert spec.default_scope_type == "record"
+    assert spec.mutation_policy == "immutable"
+    assert spec.requires_instrument is False
+    assert spec.partition_time_granularity == "day"
+    assert spec.partition_bucket_count is None
+
+
 def test_unknown_dataset():
 
     with pytest.raises(

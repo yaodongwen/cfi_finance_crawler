@@ -177,7 +177,6 @@ async def test_recovery_runs_before_runtime():
         is True
     )
 
-
 @pytest.mark.asyncio
 async def test_runtime_runs_when_recovery_allows():
 
@@ -220,12 +219,54 @@ async def test_runtime_runs_when_recovery_allows():
         is True
     )
 
-    assert (
-        result.runtime
-        == {
-            "runtime": "done"
-        }
+    assert result.runtime == {"runtime": "done"}
+
+
+@pytest.mark.asyncio
+async def test_interrupted_runtime_returns_resumable_unsuccessful_result():
+    bootstrap = CrawlBootstrap(
+        recovery_orchestrator=FakeRecoveryOrchestrator(
+            recovery_result(can_continue=True)
+        ),
+        runtime=FakeRuntime(
+            {
+                "interrupted": True,
+                "shutdown_state": "draining",
+                "shutdown_requests": 1,
+            }
+        ),
     )
+
+    result = await bootstrap.run()
+
+    assert result.success is False
+    assert result.crawler_started is True
+    assert result.runtime["interrupted"] is True
+    assert "resume state preserved" in result.message
+
+
+@pytest.mark.asyncio
+async def test_supplied_platform_recovery_result_is_not_run_twice():
+    recovery = FakeRecoveryOrchestrator(recovery_result(can_continue=True))
+    runtime = FakeRuntime()
+    bootstrap = CrawlBootstrap(
+        recovery_orchestrator=recovery,
+        runtime=runtime,
+    )
+
+    result = await bootstrap.run(
+        startup_recovery_result=recovery_result(
+            can_continue=True,
+            scanned=2,
+            attempted=2,
+            recovered=2,
+        )
+    )
+
+    assert result.success is True
+    assert recovery.run_count == 0
+    assert runtime.run_count == 1
+    assert result.recovery.recovered == 2
 
 
 @pytest.mark.asyncio

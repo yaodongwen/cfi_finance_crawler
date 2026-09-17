@@ -12,6 +12,14 @@ from crawl_framework.sites.tossinvest import (
     TOSSINVEST_SITE_ID,
     TossInvestPlugin,
 )
+from crawl_framework.sites.kabutan import (
+    KABUTAN_SITE_ID,
+    KabutanPlugin,
+)
+from crawl_framework.sites.hkexnews import (
+    HKEXNEWS_SITE_ID,
+    HKEXNewsPlugin,
+)
 
 
 def register_builtin_sites(
@@ -42,4 +50,22 @@ def register_builtin_sites(
         registry.register(
             TOSSINVEST_SITE_ID,
             TossInvestPlugin,
+        )
+
+    if not registry.contains(
+        KABUTAN_SITE_ID
+    ):
+
+        registry.register(
+            KABUTAN_SITE_ID,
+            KabutanPlugin,
+        )
+
+    if not registry.contains(
+        HKEXNEWS_SITE_ID
+    ):
+
+        registry.register(
+            HKEXNEWS_SITE_ID,
+            HKEXNewsPlugin,
         )

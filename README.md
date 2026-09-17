@@ -36,7 +36,7 @@ pytest -q -p no:rerunfailures tests/unit
 最新已验证基线：
 
 ```text
-642 passed
+837 passed
 ```
 
 ## Naver 一键 Profile
@@ -76,6 +76,107 @@ config/universes/naver_finance_kr_rollout_universe.txt
 ```text
 XKRX:005930
 ```
+
+## TossInvest 一键 Profile
+
+TossInvest 使用同一个 production CLI，并提供：
+
+```text
+toss_incremental
+toss_full
+toss_historical_backfill
+```
+
+默认 universe 来自
+`config/universes/tossinvest_kr_rollout_universe.txt`，当前为 2427 个按真实
+Toss Screener discovery 顺序固化的 canonical instruments。
+
+日常增量运行：
+
+```bash
+python -m crawl_framework.cli.main crawl \
+  --site tossinvest \
+  --profile toss_incremental \
+  --trust-rsync-success \
+  --ssh-multiplex
+```
+
+安全边界的全市场运行：
+
+```bash
+python -m crawl_framework.cli.main crawl \
+  --site tossinvest \
+  --profile toss_full \
+  --trust-rsync-success \
+  --ssh-multiplex
+```
+
+两个 profile 都运行 `forum_post`、`news_article`、`news_instrument`，并默认将
+forum/news 列表限制为一轮。`toss_incremental` 保留 checkpoint 中已完成的
+news historical baseline，先重试 pending detail，再启用历史区早停；
+`toss_full` 忽略 baseline 早停，但仍保留安全页界限。
+
+`toss_historical_backfill` 不施加上述页界限，用于可恢复的显式历史基线任务。
+它不是日常运行入口，也尚未做全历史生产验收。可用 `--forum-max-pages`、
+`--news-max-pages`、`--forum-mode`、`--news-mode` 覆盖 profile 默认值。
+
+## Kabutan 免费公开新闻 Profile
+
+Kabutan Market News 不需要 instrument，支持：
+
+```text
+kabutan_incremental
+kabutan_free_full
+```
+
+日常增量：
+
+```bash
+python -m crawl_framework.cli.main \
+  --site kabutan \
+  --profile kabutan_incremental \
+  --crawl-workers 2 \
+  --http-concurrency 8 \
+  --writer-workers 2 \
+  --upload-workers 2 \
+  --catalog-workers 2 \
+  --target-file-size-mb 64 \
+  --coalesce-scope-flushes
+```
+
+扫描全部当前免费可访问范围：
+
+```bash
+python -m crawl_framework.cli.main \
+  --site kabutan \
+  --profile kabutan_free_full \
+  --kabutan-max-pages-per-month 500 \
+  --crawl-workers 2 \
+  --http-concurrency 8 \
+  --writer-workers 2 \
+  --upload-workers 2 \
+  --catalog-workers 2 \
+  --target-file-size-mb 64 \
+  --coalesce-scope-flushes
+```
+
+`kabutan_free_full` 从当前月向历史方向发现 month scope，遇到无真实文章
+链接的 Premium 边界后正常停止。兼容名称 `kabutan_full` 具有相同的免费访问
+语义。框架不会登录 Premium、猜测隐藏 news ID 或声称 2013-09 至今完整。
+
+截至 2026-09-11，incremental production acceptance 已通过；free-full 的
+最终 K13 验收因 Kabutan AWS WAF 临时返回 HTTP 405 Human Verification 而待
+重试。这不是 Premium 登录要求，框架不会绕过该验证页面。
+
+手工检查匿名访问状态：
+
+```bash
+python scripts/probe_kabutan_access.py
+```
+
+输出 `access_state=AVAILABLE`（退出码 0）后才能手工重试 K13；
+`WAF_BLOCKED` 使用退出码 2。probe 每次只请求当前月份 page 1 一次，不输出
+cookie 或请求头秘密，也不会自动启动 rollout。
 
 ## 推荐 Production 命令
 
@@ -1469,7 +1570,30 @@ Stockhouse
 
 ---
 
-# 26. 当前禁止事项
+# 26. HKEX 财务报告
+
+框架已支持 HKEX 财务报告元数据、股票关联和 PDF attachment：
+
+```bash
+# 日常增量（默认回看 400 天并下载新 PDF）
+python -m crawl_framework.cli.main crawl \
+  --site hkexnews \
+  --profile hkex_reports_incremental
+
+# 完整 canonical HK universe，可从 checkpoint 恢复
+python -m crawl_framework.cli.main crawl \
+  --site hkexnews \
+  --profile hkex_reports_full
+```
+
+只抓元数据时使用 `--no-download-report-pdf`；可用
+`--report-type annual|interim|quarterly|all`、`--report-date-from` 和
+`--report-date-to` 缩小范围。两个 profile 都走通用并发 durable pipeline，
+输出 `financial_report`、`financial_report_instrument`，启用 PDF 时还输出
+`attachment`。中断后应原命令重跑，框架会从 checkpoint/SeenStore 恢复，
+不要清空状态或手工计算 offset。
+
+# 27. 当前禁止事项
 
 在 V2 完成验证以前：
 
@@ -1502,7 +1626,7 @@ stocklake/v2/
 
 ---
 
-# 27. 最终目标
+# 28. 最终目标
 
 以后新增一个网站，例如：
 
@@ -1551,3 +1675,143 @@ N 个 Site Plugin
 ```
 
 这就是本项目的核心目标。
+# Phase M development status
+
+The production CLI supports both single-site profiles and one-command
+four-site orchestration. Every named production profile uses the bounded
+writer/upload/Catalog runtime, including conservative one-worker settings.
+Cross-site execution is concurrent and bounded. Site crawl/browser/HTTP rate
+limits remain local to each adapter, while Parquet, NAS upload and PostgreSQL
+Catalog work share platform-wide permits.
+
+```bash
+# Full accepted profile for each site
+python -m crawl_framework.cli.main run-platform --profile global_full
+
+# Incremental accepted profile for each site
+python -m crawl_framework.cli.main run-platform --profile global_incremental
+
+# Recovery diagnostics across all sites, with no remote access/crawl
+python -m crawl_framework.cli.main run-platform \
+  --profile global_incremental --recovery-only
+```
+
+Mappings are Naver, TossInvest, Kabutan free/public, then HKEX. Before Kabutan
+crawl, the orchestrator performs one access probe. AWS WAF Human Verification
+marks Kabutan `BLOCKED` and the remaining sites continue; it is not treated as
+a parser or storage failure.
+
+Resource controls:
+
+```bash
+python -m crawl_framework.cli.main run-platform \
+  --profile global_incremental \
+  --site-workers 2 \
+  --global-writer-workers 2 \
+  --global-upload-workers 2 \
+  --global-catalog-workers 2
+```
+
+Those values are the defaults. `--global-upload-workers` accepts 1 through 4;
+the conservative default is 2 because previous production runs showed SSH/NAS
+connection resets at excessive concurrency. The limits cover startup recovery,
+Parquet preparation, generic attachment upload, final flush, compaction,
+upload verification, Catalog/index, SeenStore, and checkpoint completion.
+Per-stage budget statistics are included in platform JSON/text results.
+
+Every platform run also writes an atomic aggregate manifest automatically:
+
+```text
+state/run_manifests/platform_<profile>_<timestamp>.json
+```
+
+Use an explicit path when an external scheduler needs a predictable artifact:
+
+```bash
+python -m crawl_framework.cli.main run-platform \
+  --profile global_incremental \
+  --run-manifest-path state/run_manifests/nightly_incremental.json
+```
+
+The manifest includes platform/site profiles, universe snapshot hashes and
+counts, ResumePlans, completed/skipped/incomplete scope totals, record and
+durable-file counters, uploads, Catalog jobs, startup recovery, shared resource
+budget observations, blocked/failed sites, errors, and the final or interrupted
+state. JSON is committed with an atomic same-directory replace. Text and JSON
+CLI output report the path that was written.
+
+The deterministic resume/progress matrix verifies cold, partial, and fully
+complete restarts; all six ResumePlan states; each durable recovery stage;
+unchanged replay; zero-row scopes; attachment and compaction metrics; TTY/text
+and JSON output policy; and controlled interruption. In particular, a fully
+checkpoint-complete profile performs zero crawl, Parquet, upload, and Catalog
+work, while restart progress begins from the durable completion percentage.
+
+Current restart safety rule:
+
+```text
+Re-run the same accepted single-site command/profile.
+Do not clear SeenStore, checkpoints, RecoveryStore, Catalog, or warehouse data.
+HTTP crawl is at-least-once; unchanged logical storage is effectively-once via
+record_uid + version_hash + SeenStore.
+```
+
+`--recovery-only` remains available for diagnostics. Kabutan full rollout must
+remain probe-gated while AWS WAF reports Human Verification.
+
+Phase M2 connects the read-only ResumePlanner to the production concurrent
+runtime after startup recovery. Profiles now skip checkpoints that their site
+plugin can prove are whole-scope durable before invoking the crawler. Naver and
+Toss partial/page checkpoints remain conservative and continue through their
+existing resume logic. Fine-grained recovery-stage classification was
+completed in M3.
+
+Phase M3 persists exact scope membership in new recovery manifests and resumes
+each durable stage from its minimum remaining action. In particular, an
+`uploaded` manifest verifies the recorded NAS object without uploading it
+again; `verified` proceeds to Catalog, and `catalog_registered` proceeds to
+SeenStore. Older unscoped manifests still recover globally and are never
+assigned to a scope by filename heuristics.
+
+Phase M4 adds the internal ProgressAggregator. Runtime results now include
+ResumePlan-seeded platform/site/dataset progress with record, storage, queue,
+recovery, and performance metrics. Interactive and plain-text dashboard
+selection became user-facing in Phase M5.
+
+Phase M5 exposes progress controls:
+
+```bash
+# Automatic: Rich Live on a capable TTY, text in logs/non-TTY
+python -m crawl_framework.cli.main crawl --site naver_finance \
+  --profile naver_incremental --progress
+
+# Force periodic plain text
+python -m crawl_framework.cli.main crawl --site naver_finance \
+  --profile naver_incremental --progress-style text \
+  --progress-interval-seconds 5
+
+# Disable all progress output
+python -m crawl_framework.cli.main crawl --site naver_finance \
+  --profile naver_incremental --no-progress
+```
+
+`--json` always disables the dashboard so stdout remains machine-readable.
+Rich is optional; requesting it when unavailable falls back to text.
+
+Phase M6 Ctrl-C behavior:
+
+```text
+first Ctrl-C  stop new scopes and drain accepted durable pipeline work
+second Ctrl-C cancel remaining workers faster and preserve resume state
+exit code      130 for an interrupted, resumable run
+```
+
+When `--run-manifest` is enabled, the interrupted result and shutdown state are
+written before exit. Resume by running the same profile/command again. Do not
+clear SeenStore, checkpoints, RecoveryStore, Catalog, or warehouse files.
+
+The M11 real four-site small smoke accepted this behavior with two instruments
+per instrument-scoped site. Transport processes such as Playwright may close
+during SIGINT; when shared shutdown is already active, discovery/crawl
+teardown is classified as `INTERRUPTED`, while durable writer/upload/Catalog
+errors remain failures. Kabutan WAF remains a non-fatal `BLOCKED` site.

@@ -134,6 +134,23 @@ def test_get_dataset_schema():
     )
 
 
+@pytest.mark.parametrize(
+    "dataset",
+    (
+        "financial_report",
+        "financial_report_instrument",
+        "attachment",
+    ),
+)
+def test_financial_report_schemas_use_canonical_contract(dataset):
+
+    schema = get_dataset_schema(dataset)
+
+    assert schema.arrow_schema == COMMON_SCHEMA
+    assert schema.arrow_schema.field("payload_json").nullable is False
+    assert schema.arrow_schema.field("relations_json").nullable is False
+
+
 def test_unknown_schema():
 
     with pytest.raises(

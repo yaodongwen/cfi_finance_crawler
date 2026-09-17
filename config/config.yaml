@@ -15,6 +15,25 @@ postgres:
   user: "stock"
   password: "Stock2026Secure!"
 
+browser:
+  workers: 8
+  headless: true
+  budgets:
+    instrument: 1
+    forum: 8
+    news_list: 8
+    news_detail: 8
+
+http:
+  timeout_seconds: 20
+  max_attempts: 5
+  retry_backoff_seconds: 0.5
+  base_delay_seconds: 0.0
+  throttle_delay_seconds: 1.0
+  max_delay_seconds: 60.0
+  failure_threshold: 3
+  proxies: []
+
 storage:
   local_warehouse: "../warehouse"
   server_warehouse: "/mnt/nas-intern/homes/dwyao/Data/stocklake"

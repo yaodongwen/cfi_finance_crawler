@@ -5,6 +5,7 @@ from datetime import (
     datetime,
     timezone,
 )
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
@@ -13,6 +14,7 @@ import pyarrow.parquet as pq
 from crawl_framework.storage.compaction import (
     build_compaction_plan,
     compact_active_dataset,
+    deduplicate_table,
     publish_compaction_result,
     write_compacted_group,
 )
@@ -365,6 +367,68 @@ def test_write_compacted_group_writes_replacement_parquet(
             "month=08/day=26/bucket=20/"
         )
     )
+
+
+def test_write_compacted_group_materializes_remote_sources(tmp_path):
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    row = {
+        "schema_version": 1,
+        "record_uid": "same",
+        "event_time": datetime(2026, 8, 26, 1, tzinfo=UTC),
+        "instrument_id": "XKRX:042700",
+    }
+    write_parquet(first, [row])
+    write_parquet(second, [row])
+    files = [
+        replace(make_file(file_id=1, path=first, row_count=1), remote_path="/nas/first"),
+        replace(make_file(file_id=2, path=second, row_count=1), remote_path="/nas/second"),
+    ]
+    paths = {1: first, 2: second}
+
+    class Resolver:
+        def __init__(self):
+            self.calls = []
+
+        def materialize(self, *, item, temp_dir):
+            self.calls.append((item.id, temp_dir))
+            return paths[item.id]
+
+    resolver = Resolver()
+    group = build_compaction_plan(files).groups[0]
+    result = write_compacted_group(
+        group,
+        output_root=tmp_path / "out",
+        source_resolver=resolver,
+    )
+
+    assert [file_id for file_id, _ in resolver.calls] == [1, 2]
+    assert result.replacement_rows == 1
+    assert result.duplicate_rows_removed == 1
+
+
+def test_deduplicate_prefers_latest_crawl_over_null_event_time():
+    older = datetime(2026, 9, 8, 1, tzinfo=UTC)
+    newer = datetime(2026, 9, 8, 2, tzinfo=UTC)
+    table = pa.Table.from_pylist([
+        {
+            "record_uid": "same",
+            "event_time": None,
+            "crawled_at": older,
+            "version_hash": "old-null-event",
+        },
+        {
+            "record_uid": "same",
+            "event_time": datetime(2026, 9, 8, tzinfo=UTC),
+            "crawled_at": newer,
+            "version_hash": "new-dated-event",
+        },
+    ])
+
+    result = deduplicate_table(table)
+
+    assert result.num_rows == 1
+    assert result["version_hash"].to_pylist() == ["new-dated-event"]
 
 
 class FakeUploader:

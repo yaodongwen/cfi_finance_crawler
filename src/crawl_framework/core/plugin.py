@@ -204,6 +204,22 @@ class SitePlugin(
         Storage recovery
     """
 
+    def is_checkpoint_durable_complete(
+        self,
+        dataset: str,
+        scope: CrawlScope,
+        checkpoint: CrawlCheckpoint,
+        ctx: CrawlContext,
+    ) -> bool:
+        """Return True only for a proven whole-scope durable checkpoint.
+
+        Checkpoint payloads remain site-specific. The conservative default
+        prevents core code from treating an arbitrary page cursor as complete.
+        """
+
+        del dataset, scope, checkpoint, ctx
+        return False
+
 
     # ========================================================
     # Site metadata

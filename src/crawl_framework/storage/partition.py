@@ -367,16 +367,32 @@ class Partitioner:
 
         bucket = stable_bucket(
             bucket_key,
-            bucket_count=self.bucket_count,
+            bucket_count=(
+                spec.partition_bucket_count
+                if spec.partition_bucket_count is not None
+                else self.bucket_count
+            ),
         )
+
+        bucket_count = (
+            spec.partition_bucket_count
+            if spec.partition_bucket_count is not None
+            else self.bucket_count
+        )
+
+        partition_date = dt.date()
+        if spec.partition_time_granularity == "month":
+            partition_date = partition_date.replace(day=1)
+        elif spec.partition_time_granularity == "year":
+            partition_date = partition_date.replace(month=1, day=1)
 
         return PartitionKey(
             site_id=record.site_id,
             country=record.country,
             dataset=record.dataset,
-            partition_date=dt.date(),
+            partition_date=partition_date,
             bucket=bucket,
-            bucket_count=self.bucket_count,
+            bucket_count=bucket_count,
         )
 
 

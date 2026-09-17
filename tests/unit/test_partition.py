@@ -252,3 +252,47 @@ def test_custom_bucket_count():
         <= key.bucket
         < 16
     )
+
+
+def test_financial_reports_coalesce_by_year_across_instruments():
+    partitioner = Partitioner()
+    first = CanonicalRecord(
+        site_id="hkexnews",
+        country="HK",
+        dataset="financial_report",
+        source_id="a",
+        instrument_id="XHKG:00005",
+        event_time=datetime(2026, 3, 26, tzinfo=timezone.utc),
+    )
+    second = CanonicalRecord(
+        site_id="hkexnews",
+        country="HK",
+        dataset="financial_report",
+        source_id="b",
+        instrument_id="XHKG:00700",
+        event_time=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+
+    first_key = partitioner.partition_for(first)
+    second_key = partitioner.partition_for(second)
+
+    assert first_key == second_key
+    assert first_key.partition_date.isoformat() == "2026-01-01"
+    assert first_key.bucket_count == 1
+    assert first_key.bucket == 0
+
+
+def test_existing_daily_dataset_partitioning_is_unchanged():
+    record = CanonicalRecord(
+        site_id="naver_finance",
+        country="KR",
+        dataset="forum_post",
+        source_id="post",
+        instrument_id="XKRX:005930",
+        event_time=datetime(2026, 9, 15, tzinfo=timezone.utc),
+    )
+
+    key = Partitioner().partition_for(record)
+
+    assert key.partition_date.isoformat() == "2026-09-15"
+    assert key.bucket_count == 256

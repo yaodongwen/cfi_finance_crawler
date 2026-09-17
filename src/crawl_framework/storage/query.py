@@ -27,6 +27,7 @@ from typing import (
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from crawl_framework.core.dataset import get_dataset_spec
 from crawl_framework.storage.postgres import (
     CatalogDataFile,
     PostgresCatalog,
@@ -71,6 +72,7 @@ DEFAULT_COLUMNS: tuple[str, ...] = (
 )
 
 RELATION_AWARE_DATASETS = {
+    "financial_report",
     "news_article",
     "research_report",
 }
@@ -737,8 +739,24 @@ def normalize_query(
         spec.columns
     )
 
-    buckets = instrument_buckets(
-        instrument_ids
+    try:
+        dataset_spec = get_dataset_spec(dataset)
+        dataset_bucket_counts = (
+            dataset_spec.partition_bucket_count or 256,
+            *dataset_spec.legacy_partition_bucket_counts,
+        )
+    except KeyError:
+        dataset_bucket_counts = (256,)
+
+    buckets = tuple(
+        dict.fromkeys(
+            bucket
+            for bucket_count in dataset_bucket_counts
+            for bucket in instrument_buckets(
+                instrument_ids,
+                bucket_count=bucket_count,
+            )
+        )
     )
 
     bucket = (
@@ -817,6 +835,18 @@ def catalog_partition_date_range(
     first_date = (
         query.start_time.date()
     )
+
+    try:
+        granularity = get_dataset_spec(
+            query.dataset
+        ).partition_time_granularity
+    except KeyError:
+        granularity = "day"
+
+    if granularity == "year":
+        first_date = first_date.replace(month=1, day=1)
+    elif granularity == "month":
+        first_date = first_date.replace(day=1)
 
     last_included_time = (
         query.end_time_exclusive

@@ -136,6 +136,36 @@ class LocalConfig:
     index_cache_dir: Path
 
 
+@dataclass(frozen=True, slots=True)
+class BrowserConfig:
+    workers: int = 2
+    headless: bool = True
+    profile_root: Path | None = None
+    locale: str = "ko-KR"
+    timezone_id: str = "Asia/Seoul"
+    page_timeout_ms: int = 30_000
+    navigation_timeout_ms: int = 45_000
+    recycle_after_scopes: int = 50
+    proxies: tuple[str, ...] = ()
+    proxy_strategy: str = "round_robin"
+    proxy_failure_cooldown_seconds: float = 30.0
+    worker_budgets: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HttpConfig:
+    timeout_seconds: float = 20.0
+    max_attempts: int = 5
+    retry_backoff_seconds: float = 0.5
+    proxies: tuple[str, ...] = ()
+    proxy_strategy: str = "round_robin"
+    proxy_failure_cooldown_seconds: float = 30.0
+    base_delay_seconds: float = 0.0
+    throttle_delay_seconds: float = 1.0
+    max_delay_seconds: float = 60.0
+    failure_threshold: int = 3
+
+
 # ============================================================
 # Root config
 # ============================================================
@@ -166,6 +196,10 @@ class FrameworkConfig:
     queues: QueueSizeConfig = field(
         default_factory=QueueSizeConfig
     )
+
+    browser: BrowserConfig = field(default_factory=BrowserConfig)
+
+    http: HttpConfig = field(default_factory=HttpConfig)
 
 
 # ============================================================
@@ -585,6 +619,46 @@ def load_config(
         ),
     )
 
+    browser_raw = raw.get("browser", {}) or {}
+    viewport_raw = browser_raw.get("viewport", {}) or {}
+    del viewport_raw
+    browser = BrowserConfig(
+        workers=int(browser_raw.get("workers", 2)),
+        headless=bool(browser_raw.get("headless", True)),
+        profile_root=_resolve_path(base_dir, browser_raw["profile_root"])
+        if browser_raw.get("profile_root") else None,
+        locale=str(browser_raw.get("locale", "ko-KR")),
+        timezone_id=str(browser_raw.get("timezone_id", "Asia/Seoul")),
+        page_timeout_ms=int(browser_raw.get("page_timeout_ms", 30_000)),
+        navigation_timeout_ms=int(browser_raw.get("navigation_timeout_ms", 45_000)),
+        recycle_after_scopes=int(browser_raw.get("recycle_after_scopes", 50)),
+        proxies=tuple(str(value) for value in browser_raw.get("proxies", ())),
+        proxy_strategy=str(browser_raw.get("proxy_strategy", "round_robin")),
+        proxy_failure_cooldown_seconds=float(
+            browser_raw.get("proxy_failure_cooldown_seconds", 30.0)
+        ),
+        worker_budgets=tuple(
+            (str(name), int(count))
+            for name, count in (browser_raw.get("budgets", {}) or {}).items()
+        ),
+    )
+
+    http_raw = raw.get("http", {}) or {}
+    http = HttpConfig(
+        timeout_seconds=float(http_raw.get("timeout_seconds", 20.0)),
+        max_attempts=int(http_raw.get("max_attempts", 5)),
+        retry_backoff_seconds=float(http_raw.get("retry_backoff_seconds", 0.5)),
+        proxies=tuple(str(value) for value in http_raw.get("proxies", ())),
+        proxy_strategy=str(http_raw.get("proxy_strategy", "round_robin")),
+        proxy_failure_cooldown_seconds=float(
+            http_raw.get("proxy_failure_cooldown_seconds", 30.0)
+        ),
+        base_delay_seconds=float(http_raw.get("base_delay_seconds", 0.0)),
+        throttle_delay_seconds=float(http_raw.get("throttle_delay_seconds", 1.0)),
+        max_delay_seconds=float(http_raw.get("max_delay_seconds", 60.0)),
+        failure_threshold=int(http_raw.get("failure_threshold", 3)),
+    )
+
     # ========================================================
     # Validate
     # ========================================================
@@ -623,6 +697,13 @@ def load_config(
             "must be positive"
         )
 
+    if http.timeout_seconds <= 0:
+        raise ConfigError("http.timeout_seconds must be positive")
+    if http.max_attempts < 1:
+        raise ConfigError("http.max_attempts must be >= 1")
+    if http.retry_backoff_seconds < 0:
+        raise ConfigError("http.retry_backoff_seconds must be >= 0")
+
     return FrameworkConfig(
         config_path=config_path,
         local=local,
@@ -632,6 +713,8 @@ def load_config(
         sync=sync,
         runtime=runtime,
         queues=queues,
+        browser=browser,
+        http=http,
     )
 
 

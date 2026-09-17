@@ -989,6 +989,19 @@ class CrawlRuntime:
                         )
                     )
 
+            scope_checkpoint_hook = getattr(
+                self.plugin,
+                "checkpoint_after_scope",
+                None,
+            )
+            if callable(scope_checkpoint_hook):
+                candidate_checkpoint = scope_checkpoint_hook(
+                    dataset,
+                    scope,
+                    candidate_checkpoint,
+                    self.context,
+                )
+
             # =================================================
             # Durability Barrier
             # =================================================

@@ -107,6 +107,16 @@ class BaseUploader:
     ) -> UploadResult:
         raise NotImplementedError
 
+    def verify_existing(
+        self,
+        info: ParquetFileInfo,
+        *,
+        remote_path: str,
+    ) -> UploadResult:
+        """Verify an already uploaded object without transferring it again."""
+
+        raise NotImplementedError
+
 
 def _validate_local_file(
     info: ParquetFileInfo,
@@ -379,6 +389,48 @@ class LocalUploader(
             remote_size=remote_size,
             local_sha256=info.sha256,
             remote_sha256=remote_sha256,
+        )
+
+    def verify_existing(
+        self,
+        info: ParquetFileInfo,
+        *,
+        remote_path: str,
+    ) -> UploadResult:
+        path = Path(str(remote_path).strip())
+        expected = self.remote_root / info.relative_path
+        if path != expected:
+            raise UploadError(
+                f"remote path mismatch: expected={expected}, actual={path}"
+            )
+        if not path.is_file():
+            raise UploadError(f"remote file does not exist: {path}")
+
+        remote_size = path.stat().st_size
+        if remote_size != info.file_size:
+            raise UploadError(
+                "remote size mismatch: "
+                f"expected={info.file_size}, actual={remote_size}"
+            )
+
+        remote_sha256 = None
+        if self.verify_sha256:
+            remote_sha256 = _sha256_stream(path)
+            if remote_sha256 != info.sha256:
+                raise UploadError(
+                    "remote sha256 mismatch: "
+                    f"expected={info.sha256}, actual={remote_sha256}"
+                )
+
+        return UploadResult(
+            local_path=info.file_path,
+            remote_path=path.as_posix(),
+            status="verified",
+            local_size=info.file_size,
+            remote_size=remote_size,
+            local_sha256=info.sha256,
+            remote_sha256=remote_sha256,
+            message="existing remote file verified without upload",
         )
 
 
@@ -1059,4 +1111,51 @@ class RsyncUploader(
                 result.stdout.strip()
                 or None
             ),
+        )
+
+    def verify_existing(
+        self,
+        info: ParquetFileInfo,
+        *,
+        remote_path: str,
+    ) -> UploadResult:
+        actual_path = str(remote_path).strip()
+        expected_path = self.remote_file_path(info)
+        if actual_path != expected_path:
+            raise UploadError(
+                "remote path mismatch: "
+                f"expected={expected_path}, actual={actual_path}"
+            )
+        if not (self.verify_size or self.verify_sha256):
+            raise UploadError(
+                "cannot verify existing remote file: "
+                "size and sha256 verification are disabled"
+            )
+
+        remote_size = None
+        remote_sha256 = None
+        if self.verify_size:
+            remote_size = self._remote_stat_size(actual_path)
+            if remote_size != info.file_size:
+                raise UploadError(
+                    "remote size mismatch: "
+                    f"expected={info.file_size}, actual={remote_size}"
+                )
+        if self.verify_sha256:
+            remote_sha256 = self._remote_sha256(actual_path)
+            if remote_sha256 != info.sha256:
+                raise UploadError(
+                    "remote sha256 mismatch: "
+                    f"expected={info.sha256}, actual={remote_sha256}"
+                )
+
+        return UploadResult(
+            local_path=info.file_path,
+            remote_path=actual_path,
+            status="verified",
+            local_size=info.file_size,
+            remote_size=remote_size,
+            local_sha256=info.sha256,
+            remote_sha256=remote_sha256,
+            message="existing remote file verified without upload",
         )

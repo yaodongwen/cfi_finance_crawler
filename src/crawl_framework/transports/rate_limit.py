@@ -103,22 +103,42 @@ class AdaptiveRateLimiter:
         endpoint: str,
     ) -> None:
 
+        delay = self.delay_before_request(
+            endpoint
+        )
+
+        if delay > 0:
+
+            self._sleep(
+                delay
+            )
+
+
+    def delay_before_request(
+        self,
+        endpoint: str,
+    ) -> float:
+        """Return the required delay without blocking the caller."""
+
         state = self.state_for(
             endpoint
         )
 
         now = self._monotonic()
 
+        delay = 0.0
+
         if (
             state.circuit_open_until is not None
             and state.circuit_open_until > now
         ):
 
-            self._sleep(
-                state.circuit_open_until - now
+            delay += (
+                state.circuit_open_until
+                - now
             )
 
-        delay = (
+        delay += (
             self.config.base_delay_seconds
             + state.current_delay_seconds
         )
@@ -130,11 +150,7 @@ class AdaptiveRateLimiter:
                 self.config.jitter_seconds,
             )
 
-        if delay > 0:
-
-            self._sleep(
-                delay
-            )
+        return delay
 
 
     def record_success(

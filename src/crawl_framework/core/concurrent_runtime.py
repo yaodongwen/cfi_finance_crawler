@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import time
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from crawl_framework.core.concurrency import (
     DatasetResourceBudget,
+    GlobalStageBudget,
 )
 from crawl_framework.core.pipeline import (
     BatchProcessResult,
@@ -28,6 +30,14 @@ from crawl_framework.core.runtime import (
     checkpoint_key_for_scope,
     make_scope_token,
 )
+from crawl_framework.core.resume import (
+    ResumePlan,
+    ResumePlanItem,
+    ResumePlanner,
+    ResumeScope,
+    ResumeStatus,
+)
+from crawl_framework.core.shutdown import ShutdownController
 from crawl_framework.storage.buffer import (
     FlushBatch,
 )
@@ -35,6 +45,7 @@ from crawl_framework.storage.checkpoint import (
     CheckpointKey,
     CheckpointStore,
 )
+from crawl_framework.observability.progress import ProgressAggregator
 
 
 class ConcurrentRuntimeError(
@@ -43,6 +54,10 @@ class ConcurrentRuntimeError(
     """
     One or more concurrent production workers failed.
     """
+
+
+class _ForcedShutdown(BaseException):
+    """Internal control flow used after a second shutdown request."""
 
 
 @dataclass(slots=True)
@@ -128,6 +143,7 @@ class _ScopeState:
     skipped_count: int = 0
     pending_batches: int = 0
     crawl_done: bool = False
+    interrupted: bool = False
     result: ScopeRunResult | None = None
 
 
@@ -140,6 +156,7 @@ class _RecordItem:
 @dataclass(frozen=True, slots=True)
 class _FlushScopeItem:
     state: _ScopeState
+    checkpoint_scope: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +196,13 @@ class ConcurrentProductionRuntime:
         progress_reporter: ProgressReporter | None = None,
         progress_interval_seconds: float | None = None,
         flush_scope_on_scope_done: bool = True,
+        coalesce_flush_scope_count: int = 500,
         post_dataset_hook: Callable[[str], Any] | None = None,
+        resume_planner: ResumePlanner | None = None,
+        progress_aggregator: ProgressAggregator | None = None,
+        progress_finalizer: Callable[[], None] | None = None,
+        shutdown_controller: ShutdownController | None = None,
+        stage_budget: GlobalStageBudget | None = None,
     ) -> None:
         self.plugin = plugin
         self.pipeline = pipeline
@@ -204,7 +227,16 @@ class ConcurrentProductionRuntime:
         self.flush_scope_on_scope_done = bool(
             flush_scope_on_scope_done
         )
+        self.coalesce_flush_scope_count = max(
+            1,
+            int(coalesce_flush_scope_count),
+        )
         self.post_dataset_hook = post_dataset_hook
+        self.resume_planner = resume_planner
+        self.progress_aggregator = progress_aggregator
+        self.progress_finalizer = progress_finalizer
+        self.shutdown_controller = shutdown_controller or ShutdownController()
+        self.stage_budget = stage_budget
         self.stats = RuntimeStats()
         self.production_stats = ProductionPipelineStats(
             crawl_workers=self.crawl_workers,
@@ -213,8 +245,11 @@ class ConcurrentProductionRuntime:
             catalog_workers=self.catalog_workers,
         )
         self.post_dataset_results: list[Any] = []
+        self.resume_plans: dict[str, ResumePlan] = {}
         self._states: dict[str, _ScopeState] = {}
         self._results: list[ScopeRunResult] = []
+        self._interrupted = False
+        self._forced_shutdown = False
 
     async def run(
         self,
@@ -231,45 +266,81 @@ class ConcurrentProductionRuntime:
         all_results: list[ScopeRunResult] = []
 
         try:
-            for dataset in selected:
-                all_results.extend(
-                    await self.run_dataset(dataset)
-                )
-                if self.post_dataset_hook is not None:
-                    self.post_dataset_results.append(
-                        await asyncio.to_thread(
-                            self.post_dataset_hook,
+            try:
+                for dataset in selected:
+                    if self.shutdown_controller.stop_requested:
+                        self._interrupted = True
+                        break
+                    all_results.extend(
+                        await self.run_dataset(dataset)
+                    )
+                    if self.shutdown_controller.stop_requested:
+                        self._interrupted = True
+                        break
+                    if self.post_dataset_hook is not None:
+                        async with self._maintenance_slot():
+                            self.post_dataset_results.append(
+                                await asyncio.to_thread(
+                                    self.post_dataset_hook,
+                                    dataset,
+                                )
+                            )
+                        self._record_compaction_progress(
                             dataset,
+                            self.post_dataset_results[-1],
                         )
-                    )
-        finally:
-            if flush_at_end:
-                for batch in self.pipeline.buffer.flush_all():
-                    prepared = await asyncio.to_thread(
-                        self.pipeline.prepare_batch,
-                        batch,
-                    )
-                    uploaded = await asyncio.to_thread(
-                        self.pipeline.upload_prepared_batch,
-                        prepared,
-                    )
-                    await asyncio.to_thread(
-                        self.pipeline.catalog_uploaded_batch,
-                        uploaded,
-                    )
+            finally:
+                if flush_at_end and not self.shutdown_controller.abort_requested:
+                    for batch in self.pipeline.buffer.flush_all():
+                        async with self._stage_slot("writer"):
+                            prepared = await asyncio.to_thread(
+                                self.pipeline.prepare_batch,
+                                batch,
+                            )
+                        async with self._stage_slot("upload"):
+                            uploaded = await asyncio.to_thread(
+                                self.pipeline.upload_prepared_batch,
+                                prepared,
+                            )
+                        async with self._stage_slot("catalog"):
+                            await asyncio.to_thread(
+                                self.pipeline.catalog_uploaded_batch,
+                                uploaded,
+                            )
 
-        return {
-            "runtime": all_results,
-            "production_stats": self.production_stats,
-            "post_dataset": self.post_dataset_results,
-            "call_graph": (
-                "cli.main -> app_factory -> CrawlBootstrap -> "
-                "ConcurrentProductionRuntime -> crawl_queue -> "
-                "record_queue -> writer workers -> upload_queue -> "
-                "upload workers -> catalog_queue -> catalog workers -> "
-                "SeenStore/checkpoint"
-            ),
-        }
+            if (
+                self.progress_reporter is not None
+                and self.progress_aggregator is not None
+            ):
+                self.progress_reporter(None)
+
+            return {
+                "runtime": all_results,
+                "production_stats": self.production_stats,
+                "post_dataset": self.post_dataset_results,
+                "resume_plans": {
+                    dataset: plan.to_dict()
+                    for dataset, plan in self.resume_plans.items()
+                },
+                "progress": (
+                    self.progress_aggregator.snapshot().to_dict()
+                    if self.progress_aggregator is not None
+                    else None
+                ),
+                "interrupted": self._interrupted,
+                "shutdown_state": self.shutdown_controller.state.value,
+                "shutdown_requests": self.shutdown_controller.requests,
+                "call_graph": (
+                    "cli.main -> app_factory -> CrawlBootstrap -> "
+                    "ConcurrentProductionRuntime -> crawl_queue -> "
+                    "record_queue -> writer workers -> upload_queue -> "
+                    "upload workers -> catalog_queue -> catalog workers -> "
+                    "SeenStore/checkpoint"
+                ),
+            }
+        finally:
+            if self.progress_finalizer is not None:
+                self.progress_finalizer()
 
     async def run_dataset(
         self,
@@ -287,7 +358,9 @@ class ConcurrentProductionRuntime:
         self.production_stats.crawl_workers = (
             crawl_workers
         )
-        scope_queue: asyncio.Queue[CrawlScope | object] = asyncio.Queue()
+        scope_queue: asyncio.Queue[
+            CrawlScope | ResumePlanItem | object
+        ] = asyncio.Queue()
         record_queue: asyncio.Queue[_RecordItem | _FlushScopeItem | object] = (
             asyncio.Queue(maxsize=self.record_queue_size)
         )
@@ -302,6 +375,7 @@ class ConcurrentProductionRuntime:
         failure_event = asyncio.Event()
         worker_errors: list[BaseException] = []
         worker_errors_lock = asyncio.Lock()
+        coalesced_scopes_since_flush = 0
 
         async def record_worker_error(
             exc: BaseException,
@@ -350,6 +424,14 @@ class ConcurrentProductionRuntime:
                 self.production_stats.max_catalog_queue_depth,
                 catalog_queue.qsize(),
             )
+            if self.progress_aggregator is not None:
+                self.progress_aggregator.observe_queues(
+                    self.plugin.site_id,
+                    dataset,
+                    record_current=record_queue.qsize(),
+                    upload_current=upload_queue.qsize(),
+                    catalog_current=catalog_queue.qsize(),
+                )
 
         def make_progress_snapshot() -> ProgressSnapshot:
             return ProgressSnapshot(
@@ -412,11 +494,51 @@ class ConcurrentProductionRuntime:
 
         async def discover() -> None:
             try:
+                discovered: list[CrawlScope] = []
                 async for scope in self.plugin.discover(dataset, self.context):
-                    if failure_event.is_set():
+                    if (
+                        failure_event.is_set()
+                        or self.shutdown_controller.stop_requested
+                    ):
+                        self._interrupted = self.shutdown_controller.stop_requested
                         return
                     self.stats.scopes_discovered += 1
-                    await scope_queue.put(scope)
+                    discovered.append(scope)
+
+                if self.resume_planner is None:
+                    for scope in discovered:
+                        if self.shutdown_controller.stop_requested:
+                            self._interrupted = True
+                            return
+                        await scope_queue.put(scope)
+                    return
+
+                plan = self.resume_planner.build(
+                    ResumeScope(
+                        site_id=self.plugin.site_id,
+                        dataset=dataset,
+                        scope=scope,
+                    )
+                    for scope in discovered
+                )
+                self.resume_plans[dataset] = plan
+                if self.progress_aggregator is not None:
+                    self.progress_aggregator.seed_resume_plan(plan)
+                self.stats.checkpoints_loaded += plan.total_scopes
+
+                for item in plan.items:
+                    if self.shutdown_controller.stop_requested:
+                        self._interrupted = True
+                        return
+                    if item.should_crawl:
+                        await scope_queue.put(item)
+                    elif item.status is ResumeStatus.DURABLE_COMPLETE:
+                        self._record_durable_resume_skip(item)
+            except Exception:
+                if self.shutdown_controller.stop_requested:
+                    self._interrupted = True
+                    return
+                raise
             finally:
                 for _ in range(crawl_workers):
                     await scope_queue.put(sentinel)
@@ -430,9 +552,23 @@ class ConcurrentProductionRuntime:
                             return
                         if failure_event.is_set():
                             return
+                        if self.shutdown_controller.stop_requested:
+                            self._interrupted = True
+                            return
+                        planned_checkpoint = None
+                        if isinstance(scope, ResumePlanItem):
+                            planned_checkpoint = CrawlCheckpoint(
+                                state=dict(scope.evidence.checkpoint_state)
+                            )
+                            scope = scope.scope.scope
                         assert isinstance(scope, CrawlScope)
-                        state = self._begin_scope(dataset, scope)
+                        state = self._begin_scope(
+                            dataset,
+                            scope,
+                            checkpoint=planned_checkpoint,
+                        )
                         start = time.monotonic()
+                        scope_interrupted = False
                         try:
                             async for raw in self.plugin.crawl(
                                 dataset,
@@ -442,24 +578,46 @@ class ConcurrentProductionRuntime:
                             ):
                                 if failure_event.is_set():
                                     return
+                                if self.shutdown_controller.stop_requested:
+                                    self._interrupted = True
+                                    scope_interrupted = True
+                                    break
                                 self.stats.raw_records += 1
                                 self.production_stats.records_crawled += 1
                                 state.raw_count += 1
+                                if self.progress_aggregator is not None:
+                                    self.progress_aggregator.record_activity(
+                                        self.plugin.site_id,
+                                        dataset,
+                                        crawled=1,
+                                    )
                                 await checked_put(
                                     record_queue,
                                     _RecordItem(state=state, raw=raw),
                                     "record_queue_put_waits",
                                 )
                                 remember_depths()
+                            if self.shutdown_controller.stop_requested:
+                                self._interrupted = True
+                                scope_interrupted = True
                         finally:
                             end = time.monotonic()
                             self.production_stats.crawl_busy_time += end - start
                             self.production_stats.crawl_intervals.append(
                                 (start, end)
                             )
+                            if self.progress_aggregator is not None:
+                                self.progress_aggregator.busy_time(
+                                    self.plugin.site_id,
+                                    dataset,
+                                    crawl=end - start,
+                                )
                         await checked_put(
                             record_queue,
-                            _FlushScopeItem(state=state),
+                            _FlushScopeItem(
+                                state=state,
+                                checkpoint_scope=not scope_interrupted,
+                            ),
                             "record_queue_put_waits",
                         )
                         remember_depths()
@@ -468,10 +626,14 @@ class ConcurrentProductionRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self.shutdown_controller.stop_requested:
+                    self._interrupted = True
+                    return
                 await record_worker_error(exc)
                 raise
 
         async def writer_worker() -> None:
+            nonlocal coalesced_scopes_since_flush
             try:
                 while True:
                     item = await record_queue.get()
@@ -495,12 +657,25 @@ class ConcurrentProductionRuntime:
                                 else:
                                     self.stats.normalized_records += 1
                                     item.state.normalized_count += 1
-                                    _, batches = (
+                                    decision, batches = (
                                         self.pipeline.submit_for_staged_runtime(
                                             record,
                                             scope_token=item.state.scope_token,
                                         )
                                     )
+                                    if self.progress_aggregator is not None:
+                                        self.progress_aggregator.record_activity(
+                                            self.plugin.site_id,
+                                            dataset,
+                                            normalized=1,
+                                            **{decision.decision: 1},
+                                        )
+                                        if decision.buffered:
+                                            self.progress_aggregator.storage_activity(
+                                                self.plugin.site_id,
+                                                dataset,
+                                                buffered_rows=1,
+                                            )
                                     hook = getattr(
                                         self.plugin,
                                         "checkpoint_after_record",
@@ -516,10 +691,31 @@ class ConcurrentProductionRuntime:
                                             self.context,
                                         )
                             elif isinstance(item, _FlushScopeItem):
+                                item.state.interrupted = not item.checkpoint_scope
+                                scope_hook = getattr(
+                                    self.plugin,
+                                    "checkpoint_after_scope",
+                                    None,
+                                )
+                                if callable(scope_hook) and item.checkpoint_scope:
+                                    item.state.candidate_checkpoint = scope_hook(
+                                        dataset,
+                                        item.state.scope,
+                                        item.state.candidate_checkpoint,
+                                        self.context,
+                                    )
                                 if self.flush_scope_on_scope_done:
                                     batches = self.pipeline.buffer.flush_scope(
                                         item.state.scope_token
                                     )
+                                else:
+                                    coalesced_scopes_since_flush += 1
+                                    if (
+                                        coalesced_scopes_since_flush
+                                        >= self.coalesce_flush_scope_count
+                                    ):
+                                        batches = self.pipeline.buffer.flush_all()
+                                        coalesced_scopes_since_flush = 0
                                 item.state.crawl_done = True
                             else:
                                 raise TypeError(type(item).__name__)
@@ -537,6 +733,12 @@ class ConcurrentProductionRuntime:
                             self.production_stats.write_intervals.append(
                                 (start, end)
                             )
+                            if self.progress_aggregator is not None:
+                                self.progress_aggregator.busy_time(
+                                    self.plugin.site_id,
+                                    dataset,
+                                    write=end - start,
+                                )
 
                         if isinstance(item, _FlushScopeItem):
                             self._complete_scope_if_ready(item.state)
@@ -559,22 +761,47 @@ class ConcurrentProductionRuntime:
                             return
                         assert isinstance(item, _UploadJob)
                         start = time.monotonic()
-                        prepared: PreparedBatch = await asyncio.to_thread(
-                            self.pipeline.prepare_batch,
-                            item.batch,
-                        )
+                        async with self._stage_slot("writer"):
+                            prepared: PreparedBatch = await asyncio.to_thread(
+                                self.pipeline.prepare_batch,
+                                item.batch,
+                            )
                         self.production_stats.files_written += 1
                         self.production_stats.uploads_started += 1
-                        uploaded: UploadedBatch = await asyncio.to_thread(
-                            self.pipeline.upload_prepared_batch,
-                            prepared,
-                        )
+                        if self.progress_aggregator is not None:
+                            self.progress_aggregator.storage_activity(
+                                self.plugin.site_id,
+                                dataset,
+                                files_prepared=1,
+                                files_written=1,
+                            )
+                        async with self._stage_slot("upload"):
+                            uploaded: UploadedBatch = await asyncio.to_thread(
+                                self.pipeline.upload_prepared_batch,
+                                prepared,
+                            )
                         self.production_stats.uploads_completed += 1
+                        if self.progress_aggregator is not None:
+                            self.progress_aggregator.storage_activity(
+                                self.plugin.site_id,
+                                dataset,
+                                files_uploaded=1,
+                                files_verified=1,
+                                uploaded_bytes=(
+                                    uploaded.prepared.parquet_info.file_size
+                                ),
+                            )
                         end = time.monotonic()
                         self.production_stats.upload_busy_time += end - start
                         self.production_stats.upload_intervals.append(
                             (start, end)
                         )
+                        if self.progress_aggregator is not None:
+                            self.progress_aggregator.busy_time(
+                                self.plugin.site_id,
+                                dataset,
+                                upload=end - start,
+                            )
                         await checked_put(
                             catalog_queue,
                             _CatalogJob(uploaded=uploaded),
@@ -601,16 +828,29 @@ class ConcurrentProductionRuntime:
                         assert isinstance(item, _CatalogJob)
                         self.production_stats.catalog_jobs_started += 1
                         start = time.monotonic()
-                        result: BatchProcessResult = await asyncio.to_thread(
-                            self.pipeline.catalog_uploaded_batch,
-                            item.uploaded,
-                        )
+                        async with self._stage_slot("catalog"):
+                            result: BatchProcessResult = await asyncio.to_thread(
+                                self.pipeline.catalog_uploaded_batch,
+                                item.uploaded,
+                            )
                         end = time.monotonic()
                         self.production_stats.catalog_busy_time += end - start
                         self.production_stats.catalog_intervals.append(
                             (start, end)
                         )
                         self.production_stats.catalog_jobs_completed += 1
+                        if self.progress_aggregator is not None:
+                            self.progress_aggregator.storage_activity(
+                                self.plugin.site_id,
+                                dataset,
+                                files_cataloged=1,
+                                active_files=1,
+                            )
+                            self.progress_aggregator.busy_time(
+                                self.plugin.site_id,
+                                dataset,
+                                catalog=end - start,
+                            )
                         self._complete_batch(
                             item.uploaded.prepared.batch,
                             result,
@@ -655,19 +895,41 @@ class ConcurrentProductionRuntime:
             failure_waiter = asyncio.create_task(
                 failure_event.wait()
             )
-            done, pending = await asyncio.wait(
-                {
+            abort_waiter = asyncio.create_task(
+                self.shutdown_controller.wait_for_abort()
+            )
+            try:
+                done, pending = await asyncio.wait(
+                    {
+                        joined,
+                        failure_waiter,
+                        abort_waiter,
+                    },
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                for task in done:
+                    await task
+            except BaseException:
+                joined.cancel()
+                failure_waiter.cancel()
+                abort_waiter.cancel()
+                await asyncio.gather(
                     joined,
                     failure_waiter,
-                },
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+                    abort_waiter,
+                    return_exceptions=True,
+                )
+                raise
 
-            for task in pending:
-                task.cancel()
-
-            for task in done:
-                await task
+            if self.shutdown_controller.abort_requested:
+                joined.cancel()
+                await asyncio.gather(joined, return_exceptions=True)
+                raise _ForcedShutdown
 
             if failure_event.is_set():
                 joined.cancel()
@@ -723,8 +985,9 @@ class ConcurrentProductionRuntime:
                     ]
                 ]
             )
-        except Exception:
-            self.stats.errors += 1
+        except BaseException as exc:
+            if not isinstance(exc, _ForcedShutdown):
+                self.stats.errors += 1
             for task in tasks:
                 task.cancel()
             progress_task.cancel()
@@ -733,11 +996,15 @@ class ConcurrentProductionRuntime:
                 progress_task,
                 return_exceptions=True,
             )
-            if worker_errors:
+            if isinstance(exc, _ForcedShutdown):
+                self._interrupted = True
+                self._forced_shutdown = True
+            elif worker_errors:
                 raise _make_concurrent_runtime_error(
                     worker_errors
                 )
-            raise
+            else:
+                raise
 
         progress_task.cancel()
         await asyncio.gather(
@@ -745,7 +1012,17 @@ class ConcurrentProductionRuntime:
             return_exceptions=True,
         )
 
-        self.stats.datasets_finished += 1
+        if self.progress_aggregator is not None:
+            self.progress_aggregator.observe_queues(
+                self.plugin.site_id,
+                dataset,
+                record_current=record_queue.qsize(),
+                upload_current=upload_queue.qsize(),
+                catalog_current=catalog_queue.qsize(),
+            )
+
+        if not self._forced_shutdown:
+            self.stats.datasets_finished += 1
         results = list(self._results)
         self._results.clear()
         self._states.clear()
@@ -817,12 +1094,29 @@ class ConcurrentProductionRuntime:
 
         return value
 
+    def _stage_slot(self, stage: str):
+        if self.stage_budget is None:
+            return _unlimited_stage_slot()
+        return getattr(self.stage_budget, f"{stage}_slot")()
+
+    def _maintenance_slot(self):
+        if self.stage_budget is None:
+            return _unlimited_stage_slot()
+        return self.stage_budget.maintenance_slot()
+
     def _begin_scope(
         self,
         dataset: str,
         scope: CrawlScope,
+        *,
+        checkpoint: CrawlCheckpoint | None = None,
     ) -> _ScopeState:
         self.stats.scopes_started += 1
+        if self.progress_aggregator is not None:
+            self.progress_aggregator.scope_started(
+                self.plugin.site_id,
+                dataset,
+            )
         scope_token = make_scope_token(
             site_id=self.plugin.site_id,
             dataset=dataset,
@@ -833,8 +1127,9 @@ class ConcurrentProductionRuntime:
             dataset=dataset,
             scope=scope,
         )
-        checkpoint = self.checkpoint_store.load(checkpoint_key)
-        self.stats.checkpoints_loaded += 1
+        if checkpoint is None:
+            checkpoint = self.checkpoint_store.load(checkpoint_key)
+            self.stats.checkpoints_loaded += 1
         state = _ScopeState(
             dataset=dataset,
             scope=scope,
@@ -845,6 +1140,27 @@ class ConcurrentProductionRuntime:
         )
         self._states[scope_token] = state
         return state
+
+    def _record_durable_resume_skip(
+        self,
+        item: ResumePlanItem,
+    ) -> None:
+        scope = item.scope.scope
+        self.stats.scopes_finished += 1
+        self._results.append(
+            ScopeRunResult(
+                dataset=item.scope.dataset,
+                scope_type=scope.scope_type,
+                scope_id=scope.scope_id,
+                source_key=scope.source_key,
+                scope_token=item.scope.scope_token,
+                raw_count=0,
+                normalized_count=0,
+                skipped_count=0,
+                checkpoint_state=dict(item.evidence.checkpoint_state),
+                pipeline=ScopePipelineStats(),
+            )
+        )
 
     def _track_batch(self, batch: FlushBatch) -> None:
         for scope_token in batch.scope_tokens:
@@ -912,7 +1228,38 @@ class ConcurrentProductionRuntime:
             pipeline=ScopePipelineStats(),
         )
         self.stats.scopes_finished += 1
+        if self.progress_aggregator is not None:
+            if state.interrupted:
+                self.progress_aggregator.scope_interrupted(
+                    self.plugin.site_id,
+                    state.dataset,
+                )
+            else:
+                self.progress_aggregator.scope_completed(
+                    self.plugin.site_id,
+                    state.dataset,
+                )
         self._results.append(state.result)
+
+    def _record_compaction_progress(self, dataset: str, result: Any) -> None:
+        if self.progress_aggregator is None or result is None:
+            return
+        replacement_files = int(getattr(result, "replacement_files", 0) or 0)
+        superseded = getattr(result, "source_files_superseded", None)
+        if superseded is None:
+            superseded = getattr(result, "source_files", 0)
+            if not isinstance(superseded, int):
+                try:
+                    superseded = len(superseded)
+                except TypeError:
+                    superseded = 0
+        self.progress_aggregator.storage_activity(
+            self.plugin.site_id,
+            dataset,
+            files_compacted=replacement_files,
+            replacement_files=replacement_files,
+            source_files_superseded=int(superseded or 0),
+        )
 
 
 def _has_overlap(
@@ -924,6 +1271,11 @@ def _has_overlap(
             if left_start < right_end and right_start < left_end:
                 return True
     return False
+
+
+@asynccontextmanager
+async def _unlimited_stage_slot():
+    yield
 
 
 def _make_concurrent_runtime_error(

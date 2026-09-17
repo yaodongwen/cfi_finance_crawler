@@ -423,6 +423,49 @@ def test_advance_stage(
     )
 
 
+def test_uploaded_recovery_verifies_without_uploading_again(tmp_path):
+    info = make_real_parquet(tmp_path)
+
+    class CountingUploader(LocalUploader):
+        def __init__(self, remote_root):
+            super().__init__(
+                remote_root,
+                verify_size=True,
+                verify_sha256=True,
+            )
+            self.upload_calls = 0
+            self.verify_calls = 0
+
+        def upload(self, info):
+            self.upload_calls += 1
+            return super().upload(info)
+
+        def verify_existing(self, info, *, remote_path):
+            self.verify_calls += 1
+            return super().verify_existing(info, remote_path=remote_path)
+
+    uploader = CountingUploader(tmp_path / "remote")
+    uploaded = uploader.upload(info)
+    store = RecoveryStore(tmp_path / "recovery")
+    pending = manifest_from_info(info, stage="uploaded")
+    from dataclasses import replace
+    pending = replace(pending, remote_path=uploaded.remote_path)
+    store.save(pending)
+    manager = RecoveryManager(
+        store=store,
+        uploader=uploader,
+        catalog=PostgresCatalog(FakeConnection()),
+        cleaner=Cleaner(),
+    )
+
+    result = manager.recover_one(pending)
+
+    assert result.success is True
+    assert uploader.upload_calls == 1
+    assert uploader.verify_calls == 1
+    assert store.load(pending.manifest_id).stage == "catalog_registered"
+
+
 def test_cannot_move_backward():
 
     manifest = make_manifest()
@@ -2427,5 +2470,4 @@ def test_successful_resume_clears_retry_flags(
         loaded.failed_from_stage
         is None
     )
-
 

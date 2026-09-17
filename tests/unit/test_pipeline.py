@@ -1096,6 +1096,16 @@ def test_pipeline_records_record_index_path(
         == "deleted"
     )
 
+
+def test_pipeline_persists_batch_scope_tokens_in_recovery_manifest(tmp_path):
+    pipeline, _, _, recovery = make_pipeline(tmp_path)
+
+    pipeline.submit(make_record("scope-token-1"), scope_token="demo|forum|A")
+    pipeline.flush_scope("demo|forum|A")
+
+    manifest = recovery.list_all()[0]
+    assert manifest.scope_tokens == ("demo|forum|A",)
+
 def test_record_index_matches_batch_records(
     tmp_path,
 ):

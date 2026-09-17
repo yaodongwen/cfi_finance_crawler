@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import uuid
 
@@ -20,6 +21,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    Mapping,
     Protocol,
     Sequence,
 )
@@ -28,6 +30,21 @@ from crawl_framework.core.bootstrap import (
     BootstrapResult,
     CrawlBootstrap,
 )
+from crawl_framework.core.shutdown import (
+    ShutdownController,
+    ShutdownState,
+    shutdown_signal_handlers,
+)
+from crawl_framework.core.platform import (
+    PlatformOrchestrator,
+    PlatformRunResult,
+    PlatformSitePlan,
+    PlatformSiteResult,
+    PlatformSiteStatus,
+    SitePreflight,
+    resolve_global_profile,
+)
+from crawl_framework.core.concurrency import GlobalStageBudget
 
 
 NAVER_FULL_PROFILE_DATASETS = (
@@ -53,6 +70,29 @@ NAVER_ROLLOUT_UNIVERSE_PATH = Path(
     "naver_finance_kr_rollout_universe.txt"
 )
 
+TOSS_PROFILE_DATASETS = (
+    "forum_post",
+    "news_article",
+    "news_instrument",
+)
+
+TOSS_ROLLOUT_UNIVERSE_PATH = Path(
+    "config/universes/"
+    "tossinvest_kr_rollout_universe.txt"
+)
+
+KABUTAN_PROFILE_DATASETS = ("news_article",)
+
+HKEX_REPORT_PROFILE_DATASETS = (
+    "financial_report",
+    "financial_report_instrument",
+    "attachment",
+)
+
+HKEX_ROLLOUT_UNIVERSE_PATH = Path(
+    "config/universes/hkex_hk_rollout_universe.txt"
+)
+
 
 # ============================================================
 # Exit codes
@@ -66,6 +106,8 @@ EXIT_STARTUP_BLOCKED = 2
 EXIT_RUNTIME_ERROR = 3
 
 EXIT_CONFIGURATION_ERROR = 4
+
+EXIT_INTERRUPTED = 130
 
 
 # ============================================================
@@ -189,6 +231,8 @@ class CLIOptions:
 
     news_mode: str | None = None
 
+    forum_mode: str | None = None
+
     research_mode: str | None = None
 
     download_research_pdf: bool | None = None
@@ -210,6 +254,10 @@ class CLIOptions:
     research_http_concurrency: int | None = None
 
     progress_interval_seconds: float | None = None
+
+    progress_enabled: bool | None = None
+
+    progress_style: str = "auto"
 
     run_manifest: bool = False
 
@@ -241,12 +289,53 @@ class CLIOptions:
 
     instrument_limit: int | None = None
 
+    instrument_offset: int = 0
+
     research_categories: tuple[
         str,
         ...
     ] | None = None
 
     attachment_limit: int | None = None
+
+    kabutan_start_month: str | None = None
+
+    kabutan_end_month: str | None = None
+
+    kabutan_overlap_months: int | None = None
+
+    kabutan_max_pages_per_month: int | None = None
+
+    report_types: tuple[str, ...] | None = None
+
+    report_date_from: str | None = None
+
+    report_date_to: str | None = None
+
+    report_lookback_days: int | None = None
+
+    download_report_pdf: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformCLIOptions:
+    profile: str
+    flush_at_end: bool = True
+    json_output: bool = False
+    recovery_only: bool = False
+    progress_enabled: bool | None = None
+    progress_style: str = "auto"
+    progress_interval_seconds: float | None = None
+    instrument_limit: int | None = None
+    coalesce_scope_flushes: bool = False
+    trust_rsync_success: bool = False
+    ssh_multiplex: bool = False
+    compact_after_dataset: bool = False
+    site_workers: int = 2
+    global_writer_workers: int = 2
+    global_upload_workers: int = 2
+    global_catalog_workers: int = 2
+    run_manifest_path: Path | None = None
 
 # ============================================================
 # Factory protocol
@@ -293,6 +382,10 @@ class CLIResult:
         | None
     ) = None
 
+    platform_result: PlatformRunResult | None = None
+
+    manifest_path: Path | None = None
+
 
 # ============================================================
 # Parser
@@ -330,6 +423,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "naver_full",
             "naver_incremental",
+            "toss_full",
+            "toss_incremental",
+            "toss_historical_backfill",
+            "kabutan_incremental",
+            "kabutan_free_full",
+            "kabutan_full",
+            "hkex_reports_incremental",
+            "hkex_reports_full",
         ),
         default=None,
         help=(
@@ -395,6 +496,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--instrument-offset",
+        dest="instrument_offset",
+        type=int,
+        default=0,
+        help=(
+            "Skip the first N effective instruments before applying "
+            "--instrument-limit. Useful for deterministic snapshot resume."
+        ),
+    )
+
     # ========================================================
     # Max pages
     # ========================================================
@@ -432,6 +544,19 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     parser.add_argument(
+        "--forum-mode",
+        dest="forum_mode",
+        choices=(
+            "incremental",
+            "full",
+        ),
+        default=None,
+        help=(
+            "Forum crawl mode."
+        ),
+    )
+
+    parser.add_argument(
         "--news-mode",
         dest="news_mode",
         choices=(
@@ -440,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         default=None,
         help=(
-            "Naver news crawl mode."
+            "News crawl mode."
         ),
     )
 
@@ -476,6 +601,30 @@ def build_parser() -> argparse.ArgumentParser:
             "Disable Naver research PDF attachment "
             "downloads for this run."
         ),
+    )
+
+    parser.add_argument(
+        "--report-type",
+        dest="report_types",
+        action="append",
+        choices=("annual", "interim", "quarterly", "all"),
+        default=None,
+    )
+    parser.add_argument("--report-date-from", default=None, metavar="YYYY-MM-DD")
+    parser.add_argument("--report-date-to", default=None, metavar="YYYY-MM-DD")
+    parser.add_argument(
+        "--report-lookback-days", type=int, default=None, metavar="N"
+    )
+    parser.add_argument(
+        "--download-report-pdf",
+        dest="download_report_pdf",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-download-report-pdf",
+        dest="download_report_pdf",
+        action="store_false",
     )
 
     for option_name in (
@@ -530,6 +679,38 @@ def build_parser() -> argparse.ArgumentParser:
             "Maximum number of attachments to process "
             "during this run. Must be positive."
         ),
+    )
+
+    parser.add_argument("--kabutan-start-month", default=None, metavar="YYYY-MM")
+    parser.add_argument("--kabutan-end-month", default=None, metavar="YYYY-MM")
+    parser.add_argument("--kabutan-overlap-months", type=int, default=None, metavar="N")
+    parser.add_argument(
+        "--kabutan-max-pages-per-month",
+        type=int,
+        default=None,
+        metavar="N",
+    )
+
+    progress_group = parser.add_mutually_exclusive_group()
+    progress_group.add_argument(
+        "--progress",
+        dest="progress_enabled",
+        action="store_true",
+        help="Enable production progress output.",
+    )
+    progress_group.add_argument(
+        "--no-progress",
+        dest="progress_enabled",
+        action="store_false",
+        help="Disable production progress output.",
+    )
+    parser.set_defaults(progress_enabled=None)
+
+    parser.add_argument(
+        "--progress-style",
+        choices=("auto", "rich", "text"),
+        default="auto",
+        help="Progress renderer. Auto uses Rich on a TTY and text otherwise.",
     )
 
     parser.add_argument(
@@ -655,6 +836,130 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
+
+def build_platform_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="crawl-framework run-platform",
+        description="Run the official four-site production profile.",
+    )
+    parser.add_argument(
+        "--profile",
+        required=True,
+        choices=("global_full", "global_incremental"),
+    )
+    parser.add_argument("--json", dest="json_output", action="store_true")
+    parser.add_argument("--recovery-only", action="store_true")
+    parser.add_argument("--no-final-flush", action="store_true")
+    parser.add_argument("--instrument-limit", type=int, default=None)
+    progress = parser.add_mutually_exclusive_group()
+    progress.add_argument("--progress", dest="progress_enabled", action="store_true")
+    progress.add_argument(
+        "--no-progress", dest="progress_enabled", action="store_false"
+    )
+    parser.set_defaults(progress_enabled=None)
+    parser.add_argument(
+        "--progress-style",
+        choices=("auto", "rich", "text"),
+        default="auto",
+    )
+    parser.add_argument("--progress-interval-seconds", type=float, default=None)
+    parser.add_argument("--coalesce-scope-flushes", action="store_true")
+    parser.add_argument("--trust-rsync-success", action="store_true")
+    parser.add_argument("--ssh-multiplex", action="store_true")
+    parser.add_argument("--compact-after-dataset", action="store_true")
+    parser.add_argument("--site-workers", type=int, default=2)
+    parser.add_argument("--global-writer-workers", type=int, default=2)
+    parser.add_argument("--global-upload-workers", type=int, default=2)
+    parser.add_argument("--global-catalog-workers", type=int, default=2)
+    parser.add_argument(
+        "--run-manifest-path",
+        type=Path,
+        default=None,
+        help=(
+            "Path for the atomic platform manifest. Defaults to "
+            "state/run_manifests/platform_<profile>_<timestamp>.json."
+        ),
+    )
+    return parser
+
+
+def parse_platform_args(
+    argv: Sequence[str] | None = None,
+) -> PlatformCLIOptions:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] == "run-platform":
+        values = values[1:]
+    parser = build_platform_parser()
+    args = parser.parse_args(values)
+    if args.instrument_limit is not None and args.instrument_limit <= 0:
+        parser.error("--instrument-limit must be positive")
+    if (
+        args.progress_interval_seconds is not None
+        and args.progress_interval_seconds <= 0
+    ):
+        parser.error("--progress-interval-seconds must be positive")
+    for name in (
+        "site_workers",
+        "global_writer_workers",
+        "global_upload_workers",
+        "global_catalog_workers",
+    ):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.global_upload_workers > 4:
+        parser.error("--global-upload-workers must not exceed 4")
+    return PlatformCLIOptions(
+        profile=args.profile,
+        flush_at_end=not args.no_final_flush,
+        json_output=bool(args.json_output),
+        recovery_only=bool(args.recovery_only),
+        progress_enabled=args.progress_enabled,
+        progress_style=args.progress_style,
+        progress_interval_seconds=args.progress_interval_seconds,
+        instrument_limit=args.instrument_limit,
+        coalesce_scope_flushes=bool(args.coalesce_scope_flushes),
+        trust_rsync_success=bool(args.trust_rsync_success),
+        ssh_multiplex=bool(args.ssh_multiplex),
+        compact_after_dataset=bool(args.compact_after_dataset),
+        site_workers=args.site_workers,
+        global_writer_workers=args.global_writer_workers,
+        global_upload_workers=args.global_upload_workers,
+        global_catalog_workers=args.global_catalog_workers,
+        run_manifest_path=args.run_manifest_path,
+    )
+
+
+def platform_site_options(
+    platform: PlatformCLIOptions,
+    plan: PlatformSitePlan,
+) -> CLIOptions:
+    argv = ["--site", plan.site_id, "--profile", plan.profile]
+    if platform.json_output:
+        argv.append("--json")
+    if not platform.flush_at_end:
+        argv.append("--no-final-flush")
+    if platform.instrument_limit is not None and plan.site_id != "kabutan":
+        argv.extend(("--instrument-limit", str(platform.instrument_limit)))
+    if platform.progress_enabled is True:
+        argv.append("--progress")
+    elif platform.progress_enabled is False:
+        argv.append("--no-progress")
+    argv.extend(("--progress-style", platform.progress_style))
+    if platform.progress_interval_seconds is not None:
+        argv.extend((
+            "--progress-interval-seconds",
+            str(platform.progress_interval_seconds),
+        ))
+    if platform.coalesce_scope_flushes:
+        argv.append("--coalesce-scope-flushes")
+    if platform.trust_rsync_success:
+        argv.append("--trust-rsync-success")
+    if platform.ssh_multiplex:
+        argv.append("--ssh-multiplex")
+    if platform.compact_after_dataset:
+        argv.append("--compact-after-dataset")
+    return parse_args(argv)
+
 # ============================================================
 # Parse
 # ============================================================
@@ -729,12 +1034,26 @@ def parse_args(
 
     if (
         profile is not None
-        and site != "naver_finance"
+        and not (
+            profile.startswith("naver_")
+            and site == "naver_finance"
+        )
+        and not (
+            profile.startswith("toss_")
+            and site == "tossinvest"
+        )
+        and not (
+            profile.startswith("kabutan_")
+            and site == "kabutan"
+        )
+        and not (
+            profile.startswith("hkex_reports_")
+            and site == "hkexnews"
+        )
     ):
 
         parser.error(
-            "--profile is currently supported "
-            "only for --site naver_finance"
+            "--profile does not match --site"
         )
 
     if profile == "naver_full":
@@ -804,6 +1123,76 @@ def parse_args(
         if args.download_research_pdf is None:
 
             args.download_research_pdf = True
+
+    elif profile in {
+        "toss_full",
+        "toss_incremental",
+        "toss_historical_backfill",
+    }:
+
+        if args.datasets is None:
+
+            args.datasets = list(
+                TOSS_PROFILE_DATASETS
+            )
+
+        if args.instruments is None and args.instruments_file is None:
+
+            args.instruments_file = str(
+                TOSS_ROLLOUT_UNIVERSE_PATH
+            )
+
+        if args.forum_mode is None:
+
+            args.forum_mode = (
+                "incremental"
+                if profile == "toss_incremental"
+                else "full"
+            )
+
+        if args.news_mode is None:
+
+            args.news_mode = (
+                "incremental"
+                if profile == "toss_incremental"
+                else "full"
+            )
+
+        if profile != "toss_historical_backfill":
+
+            if args.forum_max_pages is None:
+
+                args.forum_max_pages = 1
+
+            if args.news_max_pages is None:
+
+                args.news_max_pages = 1
+
+    elif profile in {"kabutan_incremental", "kabutan_free_full", "kabutan_full"}:
+        if args.datasets is None:
+            args.datasets = list(KABUTAN_PROFILE_DATASETS)
+        if args.kabutan_overlap_months is None:
+            args.kabutan_overlap_months = 1
+        if args.kabutan_max_pages_per_month is None:
+            args.kabutan_max_pages_per_month = 500
+
+    elif profile in {"hkex_reports_incremental", "hkex_reports_full"}:
+        if args.download_report_pdf is None:
+            args.download_report_pdf = True
+        if args.datasets is None:
+            args.datasets = list(HKEX_REPORT_PROFILE_DATASETS)
+            if not args.download_report_pdf:
+                args.datasets.remove("attachment")
+        elif "attachment" in args.datasets and not args.download_report_pdf:
+            parser.error("attachment dataset conflicts with --no-download-report-pdf")
+        if args.instruments is None and args.instruments_file is None:
+            args.instruments_file = str(HKEX_ROLLOUT_UNIVERSE_PATH)
+        if args.report_types is None:
+            args.report_types = ["all"]
+        if profile == "hkex_reports_full" and args.report_date_from is None:
+            args.report_date_from = "1999-04-01"
+        if profile == "hkex_reports_incremental" and args.report_lookback_days is None:
+            args.report_lookback_days = 400
 
     # ========================================================
     # Helper:
@@ -931,6 +1320,10 @@ def parse_args(
         args.research_categories
     )
 
+    report_types = normalize_repeated(args.report_types)
+    if report_types and "all" in report_types:
+        report_types = ("annual", "interim", "quarterly")
+
     # ========================================================
     # Instruments
     # ========================================================
@@ -960,6 +1353,13 @@ def parse_args(
     )
 
     instrument_limit = args.instrument_limit
+    instrument_offset = int(args.instrument_offset)
+
+    if instrument_offset < 0:
+        parser.error("--instrument-offset must be >= 0")
+
+    if instruments is not None and instrument_offset:
+        instruments = instruments[instrument_offset:]
 
     if instrument_limit is not None:
 
@@ -1086,6 +1486,42 @@ def parse_args(
         "research_http_concurrency"
     )
 
+    kabutan_max_pages_per_month = positive_optional_int(
+        "kabutan_max_pages_per_month"
+    )
+
+    kabutan_overlap_months = args.kabutan_overlap_months
+    if kabutan_overlap_months is not None and kabutan_overlap_months < 0:
+        parser.error("--kabutan-overlap-months must be >= 0")
+
+    from crawl_framework.sites.kabutan.market_news import parse_month
+
+    for name in ("kabutan_start_month", "kabutan_end_month"):
+        value = getattr(args, name)
+        if value is not None:
+            try:
+                parse_month(value)
+            except ValueError as exc:
+                parser.error(f"--{name.replace('_', '-')} {exc}")
+
+    if args.kabutan_start_month and args.kabutan_end_month:
+        if parse_month(args.kabutan_start_month) > parse_month(args.kabutan_end_month):
+            parser.error("--kabutan-start-month must not be after --kabutan-end-month")
+
+    report_lookback_days = positive_optional_int("report_lookback_days")
+    from crawl_framework.sites.hkexnews import normalize_hkex_search_date
+
+    for name in ("report_date_from", "report_date_to"):
+        value = getattr(args, name)
+        if value is not None:
+            try:
+                setattr(args, name, normalize_hkex_search_date(value))
+            except ValueError as exc:
+                parser.error(str(exc))
+    if args.report_date_from and args.report_date_to:
+        if args.report_date_from > args.report_date_to:
+            parser.error("--report-date-from must not be after --report-date-to")
+
     progress_interval_seconds = (
         args.progress_interval_seconds
     )
@@ -1133,6 +1569,7 @@ def parse_args(
         news_max_pages=news_max_pages,
         research_max_pages=research_max_pages,
         news_mode=args.news_mode,
+        forum_mode=args.forum_mode,
         research_mode=args.research_mode,
         download_research_pdf=args.download_research_pdf,
         research_detail_workers=research_detail_workers,
@@ -1144,6 +1581,8 @@ def parse_args(
         news_http_concurrency=news_http_concurrency,
         research_http_concurrency=research_http_concurrency,
         progress_interval_seconds=progress_interval_seconds,
+        progress_enabled=args.progress_enabled,
+        progress_style=args.progress_style,
         run_manifest=(
             bool(args.run_manifest)
             or profile is not None
@@ -1192,10 +1631,20 @@ def parse_args(
             "compaction_min_file_count"
         ),
         instrument_limit=instrument_limit,
+        instrument_offset=instrument_offset,
         research_categories=(
             research_categories
         ),
         attachment_limit=attachment_limit,
+        kabutan_start_month=args.kabutan_start_month,
+        kabutan_end_month=args.kabutan_end_month,
+        kabutan_overlap_months=kabutan_overlap_months,
+        kabutan_max_pages_per_month=kabutan_max_pages_per_month,
+        report_types=report_types,
+        report_date_from=args.report_date_from,
+        report_date_to=args.report_date_to,
+        report_lookback_days=report_lookback_days,
+        download_report_pdf=args.download_report_pdf,
     )
     
 
@@ -1260,6 +1709,9 @@ def bootstrap_result_to_dict(
         "runtime": _json_safe(
             result.runtime
         ),
+        "managed_resource_stats": _json_safe(
+            result.managed_resource_stats
+        ),
     }
 
 
@@ -1298,6 +1750,47 @@ def build_run_manifest(
         options.instruments_file
     )
 
+    scope_plan = None
+    if options.site == "kabutan":
+        from crawl_framework.sites.kabutan.market_news import resolve_month_window
+
+        mode = (
+            "free_full"
+            if options.profile in {"kabutan_free_full", "kabutan_full"}
+            else "incremental"
+        )
+        runtime_payload = bootstrap_result_to_dict(result).get("runtime")
+        runtime_scopes = (
+            runtime_payload.get("runtime", [])
+            if isinstance(runtime_payload, dict)
+            else []
+        )
+        month_ids = tuple(dict.fromkeys(
+            str(item.get("scope_id"))
+            for item in runtime_scopes
+            if isinstance(item, dict)
+            and item.get("dataset") == "news_article"
+            and item.get("scope_type") == "month"
+            and item.get("scope_id")
+        ))
+        if not month_ids:
+            month_ids = resolve_month_window(
+                mode=mode,
+                start_month=options.kabutan_start_month,
+                end_month=options.kabutan_end_month,
+                overlap_months=(
+                    options.kabutan_overlap_months
+                    if options.kabutan_overlap_months is not None
+                    else 1
+                ),
+                now=started_at,
+            )
+        scope_plan = {
+            "scope_type": "month",
+            "scope_ids": list(month_ids),
+            "count": len(month_ids),
+        }
+
     return {
         "run_id": run_id,
         "site": options.site,
@@ -1307,6 +1800,7 @@ def build_run_manifest(
             or ()
         ),
         "universe": universe,
+        "scope_plan": scope_plan,
         "options": _json_safe(
             options
         ),
@@ -1321,6 +1815,9 @@ def build_run_manifest(
         ],
         "runtime": _json_safe(
             result.runtime
+        ),
+        "managed_resource_stats": _json_safe(
+            result.managed_resource_stats
         ),
     }
 
@@ -1342,23 +1839,295 @@ def write_run_manifest(
         / f"{manifest['run_id']}.json"
     )
 
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+    return _write_json_atomic(output_path, manifest)
+
+
+def build_platform_run_manifest(
+    *,
+    options: PlatformCLIOptions,
+    result: PlatformRunResult,
+    platform_run_id: str | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+    site_options: Mapping[str, CLIOptions] | None = None,
+) -> dict[str, Any]:
+    """Build one restart-safe summary around the four independent site runs."""
+
+    started_at = started_at or datetime.now(timezone.utc)
+    finished_at = finished_at or datetime.now(timezone.utc)
+    platform_run_id = platform_run_id or (
+        f"platform-{options.profile}-{started_at:%Y%m%dT%H%M%S%fZ}-"
+        f"{uuid.uuid4().hex[:8]}"
     )
 
-    output_path.write_text(
-        json.dumps(
-            manifest,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
+    plans = resolve_global_profile(options.profile)
+    options_by_site = dict(site_options or {})
+    for plan in plans:
+        if plan.site_id not in options_by_site:
+            options_by_site[plan.site_id] = platform_site_options(options, plan)
+    sites = [
+        _platform_site_manifest(
+            site_result,
+            options_by_site[site_result.site_id],
         )
-        + "\n",
-        encoding="utf-8",
-    )
+        for site_result in result.sites
+    ]
+    counters = _sum_platform_counters(sites)
+    recovery = _sum_platform_recovery(sites)
+    errors = [
+        {
+            "site_id": site["site_id"],
+            "status": site["status"],
+            "message": site["reason"],
+        }
+        for site in sites
+        if site["status"] == PlatformSiteStatus.FAILED.value
+        or int(site["recovery"].get("failed", 0)) > 0
+        or int(site["recovery"].get("terminal_failed", 0)) > 0
+    ]
 
-    return output_path
+    return {
+        "schema_version": 1,
+        "platform_run_id": platform_run_id,
+        "profile": options.profile,
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "final_state": _platform_final_state(result),
+        "success": result.success,
+        "interrupted": result.interrupted,
+        "site_workers": result.site_workers,
+        "resource_budget": _json_safe(result.resource_budget),
+        "site_profiles": {
+            site["site_id"]: site["profile"]
+            for site in sites
+        },
+        "universe_snapshots": {
+            site["site_id"]: site["universe"]
+            for site in sites
+        },
+        "resume_plan": {
+            site["site_id"]: site["resume_plan"]
+            for site in sites
+        },
+        "counters": counters,
+        "recovery": recovery,
+        "blocked_sites": list(result.blocked_sites),
+        "failed_sites": list(result.failed_sites),
+        "errors": errors,
+        "sites": sites,
+    }
+
+
+def write_platform_run_manifest(
+    manifest: dict[str, Any],
+    *,
+    path: Path | None = None,
+) -> Path:
+    if path is None:
+        timestamp = datetime.fromisoformat(manifest["started_at"]).astimezone(
+            timezone.utc
+        ).strftime("%Y%m%dT%H%M%S%fZ")
+        path = (
+            Path("state/run_manifests")
+            / f"platform_{manifest['profile']}_{timestamp}.json"
+        )
+    return _write_json_atomic(path, manifest)
+
+
+def _platform_site_manifest(
+    site_result: PlatformSiteResult,
+    options: CLIOptions,
+) -> dict[str, Any]:
+    bootstrap = (
+        bootstrap_result_to_dict(site_result.result)
+        if site_result.result is not None
+        else None
+    )
+    runtime = bootstrap.get("runtime") if bootstrap is not None else None
+    runtime = runtime if isinstance(runtime, dict) else {}
+    recovery = (
+        bootstrap["recovery"]
+        if bootstrap is not None
+        else _empty_recovery_summary()
+    )
+    return {
+        "site_id": site_result.site_id,
+        "profile": site_result.profile,
+        "status": site_result.status.value,
+        "reason": site_result.reason,
+        "access_state": site_result.access_state,
+        "datasets": list(options.datasets or ()),
+        "universe": _universe_metadata(options.instruments_file),
+        "resume_plan": _json_safe(runtime.get("resume_plans", {})),
+        "counters": _platform_site_counters(runtime),
+        "recovery": recovery,
+        "crawler_started": (
+            site_result.result.crawler_started
+            if site_result.result is not None
+            else False
+        ),
+        "runtime": _json_safe(runtime) if runtime else None,
+        "managed_resource_stats": (
+            bootstrap.get("managed_resource_stats")
+            if bootstrap is not None
+            else None
+        ),
+    }
+
+
+def _platform_site_counters(runtime: dict[str, Any]) -> dict[str, int]:
+    progress = runtime.get("progress")
+    progress = progress if isinstance(progress, dict) else {}
+    datasets = [
+        dataset
+        for site in progress.get("sites", [])
+        if isinstance(site, dict)
+        for dataset in site.get("datasets", [])
+        if isinstance(dataset, dict)
+    ]
+    stats = runtime.get("production_stats")
+    stats = stats if isinstance(stats, dict) else _json_safe(stats)
+    stats = stats if isinstance(stats, dict) else {}
+
+    total = _integer(progress.get("total_scopes"))
+    completed = _integer(progress.get("completed_scopes"))
+    incomplete = _integer(progress.get("remaining_scopes"))
+    skipped = sum(_integer(item.get("skipped_scopes")) for item in datasets)
+    if not progress:
+        plans = [
+            plan
+            for plan in runtime.get("resume_plans", {}).values()
+            if isinstance(plan, dict)
+        ]
+        total = sum(_integer(plan.get("total_scopes")) for plan in plans)
+        completed = sum(
+            _integer(plan.get("durable_complete_scopes")) for plan in plans
+        )
+        skipped = completed
+        incomplete = max(0, total - completed)
+
+    records = {
+        name: sum(
+            _integer(item.get("records", {}).get(name))
+            for item in datasets
+            if isinstance(item.get("records"), dict)
+        )
+        for name in ("crawled", "normalized", "new", "unchanged", "updated", "failed")
+    }
+    storage = {
+        name: sum(
+            _integer(item.get("storage", {}).get(name))
+            for item in datasets
+            if isinstance(item.get("storage"), dict)
+        )
+        for name in (
+            "files_written",
+            "files_uploaded",
+            "files_verified",
+            "files_cataloged",
+        )
+    }
+    if not datasets:
+        records["crawled"] = _integer(stats.get("records_crawled"))
+        storage["files_written"] = _integer(stats.get("files_written"))
+        storage["files_uploaded"] = _integer(stats.get("uploads_completed"))
+        storage["files_cataloged"] = _integer(
+            stats.get("catalog_jobs_completed")
+        )
+    pipeline_errors = _integer(runtime.get("pipeline_errors"))
+    if not pipeline_errors:
+        pipeline_errors = sum(
+            _integer(item.get("errors"))
+            for item in runtime.get("runtime", [])
+            if isinstance(item, dict)
+        )
+
+    return {
+        "total_scopes": total,
+        "completed_scopes": completed,
+        "skipped_scopes": skipped,
+        "incomplete_scopes": incomplete,
+        **{f"records_{name}": value for name, value in records.items()},
+        **storage,
+        "uploads_started": _integer(stats.get("uploads_started")),
+        "uploads_completed": _integer(stats.get("uploads_completed")),
+        "catalog_jobs_started": _integer(stats.get("catalog_jobs_started")),
+        "catalog_jobs_completed": _integer(stats.get("catalog_jobs_completed")),
+        "pipeline_errors": pipeline_errors,
+    }
+
+
+def _sum_platform_counters(sites: list[dict[str, Any]]) -> dict[str, int]:
+    keys = tuple(next(iter(sites), {"counters": {}})["counters"])
+    return {
+        key: sum(_integer(site["counters"].get(key)) for site in sites)
+        for key in keys
+    }
+
+
+def _sum_platform_recovery(sites: list[dict[str, Any]]) -> dict[str, Any]:
+    numeric = (
+        "scanned",
+        "attempted",
+        "recovered",
+        "skipped",
+        "failed",
+        "terminal_failed",
+        "remaining_pending",
+    )
+    result = {
+        key: sum(_integer(site["recovery"].get(key)) for site in sites)
+        for key in numeric
+    }
+    result["can_continue"] = all(
+        bool(site["recovery"].get("can_continue", True))
+        for site in sites
+    )
+    return result
+
+
+def _empty_recovery_summary() -> dict[str, Any]:
+    return {
+        "scanned": 0,
+        "attempted": 0,
+        "recovered": 0,
+        "skipped": 0,
+        "failed": 0,
+        "terminal_failed": 0,
+        "remaining_pending": 0,
+        "can_continue": True,
+    }
+
+
+def _platform_final_state(result: PlatformRunResult) -> str:
+    if result.interrupted:
+        return "INTERRUPTED"
+    if result.failed_sites:
+        return "FAILED"
+    if result.blocked_sites:
+        return "BLOCKED"
+    return "COMPLETE"
+
+
+def _integer(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
 
 
 def _universe_metadata(
@@ -1617,6 +2386,114 @@ def run_recovery_only(
 # ============================================================
 
 
+def format_platform_result(result: PlatformRunResult) -> str:
+    lines = [
+        f"profile={result.profile}",
+        f"success={str(result.success).lower()}",
+        f"interrupted={str(result.interrupted).lower()}",
+        f"site_workers={result.site_workers}",
+        "resource_budget=" + json.dumps(result.resource_budget, sort_keys=True),
+    ]
+    lines.extend(
+        "site={site} profile={profile} status={status}{reason}".format(
+            site=item.site_id,
+            profile=item.profile,
+            status=item.status.value,
+            reason=f" reason={item.reason}" if item.reason else "",
+        )
+        for item in result.sites
+    )
+    return "\n".join(lines)
+
+
+async def async_platform_main(
+    argv: Sequence[str] | None = None,
+    *,
+    bootstrap_factory: BootstrapFactory,
+    stdout,
+    stderr,
+    platform_preflight: SitePreflight | None = None,
+) -> CLIResult:
+    options = parse_platform_args(argv)
+    shutdown_controller = ShutdownController()
+    started_at = datetime.now(timezone.utc)
+    site_options = {
+        plan.site_id: platform_site_options(options, plan)
+        for plan in resolve_global_profile(options.profile)
+    }
+
+    def report_shutdown(state: ShutdownState) -> None:
+        if state is ShutdownState.DRAINING:
+            print(
+                "interrupt received: stopping new sites/scopes and draining "
+                "durable work; press Ctrl-C again to abort faster",
+                file=stderr,
+            )
+        else:
+            print(
+                "second interrupt received: cancelling workers and preserving "
+                "resume state",
+                file=stderr,
+            )
+
+    orchestrator = PlatformOrchestrator(
+        bootstrap_factory=bootstrap_factory,
+        site_options_factory=lambda plan: site_options[plan.site_id],
+        shutdown_controller=shutdown_controller,
+        site_preflight=platform_preflight,
+        site_workers=options.site_workers,
+        stage_budget=GlobalStageBudget(
+            writer_workers=options.global_writer_workers,
+            upload_workers=options.global_upload_workers,
+            catalog_workers=options.global_catalog_workers,
+        ),
+    )
+    with shutdown_signal_handlers(
+        shutdown_controller,
+        on_request=report_shutdown,
+    ):
+        result = await orchestrator.run(
+            options.profile,
+            recovery_only=options.recovery_only,
+        )
+
+    manifest = build_platform_run_manifest(
+        options=options,
+        result=result,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc),
+        site_options=site_options,
+    )
+    manifest_path = write_platform_run_manifest(
+        manifest,
+        path=options.run_manifest_path,
+    )
+
+    if options.json_output:
+        payload = result.to_dict()
+        payload["manifest_path"] = str(manifest_path)
+        print(json.dumps(_json_safe(payload), sort_keys=True), file=stdout)
+    else:
+        print(format_platform_result(result), file=stdout)
+        print(f"manifest_path={manifest_path}", file=stdout)
+
+    if result.interrupted:
+        exit_code = EXIT_INTERRUPTED
+        message = "platform run interrupted; resume state preserved"
+    elif result.failed_sites:
+        exit_code = EXIT_RUNTIME_ERROR
+        message = "one or more platform sites failed"
+    else:
+        exit_code = EXIT_SUCCESS
+        message = "platform run completed"
+    return CLIResult(
+        exit_code=exit_code,
+        message=message,
+        platform_result=result,
+        manifest_path=manifest_path,
+    )
+
+
 async def async_main(
     argv: Sequence[
         str
@@ -1628,6 +2505,7 @@ async def async_main(
     ) = None,
     stdout=None,
     stderr=None,
+    platform_preflight: SitePreflight | None = None,
 ) -> CLIResult:
     """
     CLI 的异步执行入口。
@@ -1651,10 +2529,6 @@ async def async_main(
 
         stderr = sys.stderr
 
-    options = parse_args(
-        argv
-    )
-
     if bootstrap_factory is None:
 
         raise (
@@ -1663,6 +2537,20 @@ async def async_main(
                 "configured yet"
             )
         )
+
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "run-platform":
+        return await async_platform_main(
+            raw_argv,
+            bootstrap_factory=bootstrap_factory,
+            stdout=stdout,
+            stderr=stderr,
+            platform_preflight=platform_preflight,
+        )
+
+    options = parse_args(
+        raw_argv
+    )
 
     try:
 
@@ -1697,6 +2585,26 @@ async def async_main(
             timezone.utc
         )
 
+        runtime = getattr(bootstrap, "runtime", None)
+        shutdown_controller = getattr(runtime, "shutdown_controller", None)
+        if shutdown_controller is None:
+            shutdown_controller = ShutdownController()
+            if runtime is not None:
+                setattr(runtime, "shutdown_controller", shutdown_controller)
+
+        def report_shutdown(state: ShutdownState) -> None:
+            if state is ShutdownState.DRAINING:
+                print(
+                    "interrupt received: stopping new scopes and draining durable work; "
+                    "press Ctrl-C again to abort faster",
+                    file=stderr,
+                )
+            else:
+                print(
+                    "second interrupt received: cancelling workers and preserving resume state",
+                    file=stderr,
+                )
+
         # ====================================================
         # Recovery only
         # ====================================================
@@ -1715,16 +2623,20 @@ async def async_main(
 
         else:
 
-            result = (
-                await bootstrap.run(
-                    datasets=(
-                        options.datasets
-                    ),
-                    flush_at_end=(
-                        options.flush_at_end
-                    ),
+            with shutdown_signal_handlers(
+                shutdown_controller,
+                on_request=report_shutdown,
+            ):
+                result = (
+                    await bootstrap.run(
+                        datasets=(
+                            options.datasets
+                        ),
+                        flush_at_end=(
+                            options.flush_at_end
+                        ),
+                    )
                 )
-            )
 
         finished_at = datetime.now(
             timezone.utc
@@ -1798,6 +2710,16 @@ async def async_main(
     # ========================================================
 
     if not result.success:
+
+        if (
+            isinstance(result.runtime, dict)
+            and result.runtime.get("interrupted")
+        ):
+            return CLIResult(
+                exit_code=EXIT_INTERRUPTED,
+                message=result.message or "interrupted",
+                bootstrap_result=result,
+            )
 
         return CLIResult(
             exit_code=(

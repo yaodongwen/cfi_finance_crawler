@@ -79,6 +79,8 @@ class BootstrapResult:
 
     message: str | None = None
 
+    managed_resource_stats: tuple[Any, ...] = ()
+
 
 # ============================================================
 # Bootstrap configuration
@@ -163,6 +165,7 @@ class CrawlBootstrap:
         recovery_orchestrator: RecoveryOrchestrator,
         runtime: CrawlRuntime,
         config: BootstrapConfig | None = None,
+        managed_resources: tuple[Any, ...] = (),
     ) -> None:
 
         self.recovery_orchestrator = (
@@ -175,6 +178,7 @@ class CrawlBootstrap:
             config
             or BootstrapConfig()
         )
+        self.managed_resources = managed_resources
 
 
     async def run(
@@ -184,6 +188,7 @@ class CrawlBootstrap:
             str
         ] | None = None,
         flush_at_end: bool | None = None,
+        startup_recovery_result: StartupRecoveryResult | None = None,
     ) -> BootstrapResult:
         """
         执行完整 bootstrap。
@@ -203,9 +208,23 @@ class CrawlBootstrap:
         # ====================================================
 
         recovery_result = (
-            self.recovery_orchestrator
-            .run()
+            startup_recovery_result
+            if startup_recovery_result is not None
+            else self.recovery_orchestrator.run()
         )
+        progress_aggregator = getattr(
+            self.runtime,
+            "progress_aggregator",
+            None,
+        )
+        if progress_aggregator is not None:
+            progress_aggregator.set_startup_recovery(
+                pending=recovery_result.remaining_pending,
+                attempted=recovery_result.attempted,
+                recovered=recovery_result.recovered,
+                retryable_failed=recovery_result.failed,
+                terminal_failed=recovery_result.terminal_failed,
+            )
 
         # ====================================================
         # 2. Recovery blocked startup
@@ -261,8 +280,12 @@ class CrawlBootstrap:
         # 4. Run crawler
         # ====================================================
 
-        runtime_result = (
-            await self.runtime.run(
+        started_resources = []
+        try:
+            for resource in self.managed_resources:
+                await resource.start()
+                started_resources.append(resource)
+            runtime_result = await self.runtime.run(
                 datasets=(
                     resolved_datasets
                 ),
@@ -270,20 +293,33 @@ class CrawlBootstrap:
                     resolved_flush_at_end
                 ),
             )
-        )
+        finally:
+            for resource in reversed(started_resources):
+                await resource.close()
 
         # ====================================================
         # 5. Success
         # ====================================================
 
+        interrupted = (
+            isinstance(runtime_result, dict)
+            and bool(runtime_result.get("interrupted"))
+        )
+
         return BootstrapResult(
             recovery=recovery_result,
             runtime=runtime_result,
             crawler_started=True,
-            success=True,
+            success=not interrupted,
             message=(
-                "startup recovery completed "
-                "and crawler runtime finished"
+                "crawler interrupted; durable work drained and resume state preserved"
+                if interrupted
+                else "startup recovery completed and crawler runtime finished"
+            ),
+            managed_resource_stats=tuple(
+                resource.stats
+                for resource in self.managed_resources
+                if getattr(resource, "stats", None) is not None
             ),
         )
 
